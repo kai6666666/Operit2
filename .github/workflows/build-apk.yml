@@ -121,6 +121,9 @@ jobs:
           mkdir -p .ci-tools/typescript/node_modules/.bin
           ln -sf "$(command -v tsc)" .ci-tools/typescript/node_modules/.bin/tsc
           tsc --version
+          cd plugins/packages/buildin/workflow
+          corepack pnpm install --frozen-lockfile
+          ls -d node_modules/typescript
 
       - name: Prepare repo python venv
         run: |
