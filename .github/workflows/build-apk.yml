@@ -115,12 +115,11 @@ jobs:
 
       - name: Prepare node build tools
         run: |
-          npm install -g typescript corepack || true
+          npm install -g corepack || true
           corepack enable || true
           corepack prepare pnpm@10.7.0 --activate || true
-          mkdir -p .ci-tools/typescript/node_modules/.bin
-          ln -sf "$(command -v tsc)" .ci-tools/typescript/node_modules/.bin/tsc
-          tsc --version
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          .ci-tools/typescript/node_modules/.bin/tsc --version
           cd plugins/packages/buildin/workflow
           corepack pnpm install --frozen-lockfile
           ls -d node_modules/typescript
