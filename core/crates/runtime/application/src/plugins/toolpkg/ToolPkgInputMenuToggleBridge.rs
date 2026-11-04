@@ -143,7 +143,7 @@ impl ToolPkgInputMenuToggleBridge {
     /// Synchronizes this bridge from the committed active package catalog.
     #[allow(non_snake_case)]
     pub fn syncToolPkgRegistrations(activeContainers: &[ToolPkgContainerRuntime]) {
-        let mut hooks = activeContainers
+        let hooks = activeContainers
             .iter()
             .flat_map(|container| {
                 container.inputMenuTogglePlugins.iter().map(|hook| {
@@ -156,11 +156,6 @@ impl ToolPkgInputMenuToggleBridge {
                 })
             })
             .collect::<Vec<_>>();
-        hooks.sort_by(|left, right| {
-            left.containerPackageName
-                .cmp(&right.containerPackageName)
-                .then(left.pluginId.cmp(&right.pluginId))
-        });
         let mut stored = INPUT_MENU_HOOKS
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
@@ -263,7 +258,7 @@ impl ToolPkgInputMenuToggleBridge {
         let Some(spec) = specs.into_iter().find(|spec| spec.id == normalizedToggleId) else {
             return false;
         };
-        launchToggle(self.runtime.clone(), spec, params);
+        runInputMenuToggleHook(&self.runtime, &spec, &params);
         true
     }
 
@@ -395,11 +390,7 @@ fn buildToggleDefinitions(
                         (paramsForToggle.onToggleFeature)(specForToggle.id.clone());
                         return;
                     }
-                    launchToggle(
-                        runtimeForToggle.clone(),
-                        specForToggle.clone(),
-                        paramsForToggle.clone(),
-                    );
+                    runInputMenuToggleHook(&runtimeForToggle, &specForToggle, &paramsForToggle);
                 }),
             }
         })
@@ -648,26 +639,13 @@ fn runInputMenuToggleHook(
                         ),
                     );
                 }
+                // Read definitions only after the plugin has persisted its new checked state.
+                let registryVersion = HOOK_REGISTRY_VERSION.load(Ordering::SeqCst);
+                let paramsCacheKey = buildCacheKey(params);
+                triggerRefresh(runtime.clone(), params, registryVersion, &paramsCacheKey);
             })
         },
     );
-}
-
-#[allow(non_snake_case)]
-fn launchToggle(
-    runtime: ToolPkgBridgeRuntime,
-    spec: InputMenuSpec,
-    params: InputMenuToggleHookParams,
-) {
-    let taskRuntime = runtime.clone();
-    launchTask(&runtime, "operit-toolpkg-input-toggle", move || {
-        Box::pin(async move {
-            runInputMenuToggleHook(&taskRuntime, &spec, &params);
-            let registryVersion = HOOK_REGISTRY_VERSION.load(Ordering::SeqCst);
-            let paramsCacheKey = buildCacheKey(&params);
-            triggerRefresh(taskRuntime, &params, registryVersion, &paramsCacheKey);
-        })
-    });
 }
 
 #[allow(non_snake_case)]

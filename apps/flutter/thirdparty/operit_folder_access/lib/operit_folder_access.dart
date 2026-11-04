@@ -8,13 +8,16 @@ class FolderMountSource {
   const FolderMountSource({
     required this.backend,
     required this.root,
-    required this.namespace,
+    required String namespace,
     required this.name,
-  });
+  }) : _namespace = namespace;
 
   final String backend;
   final String root;
-  final String namespace;
+  final String _namespace;
+  String get namespace => _namespace == '/mnt' || _namespace.startsWith('/mnt/')
+      ? '/virtual${_namespace.substring(4)}'
+      : _namespace;
   final String name;
 
   factory FolderMountSource.native(String path) {
@@ -25,7 +28,7 @@ class FolderMountSource {
     return FolderMountSource(
       backend: 'native',
       root: path,
-      namespace: '/mnt/local/folders',
+      namespace: '/virtual/local/folders',
       name: label.isEmpty ? path : label,
     );
   }
@@ -62,6 +65,13 @@ abstract final class OperitFolderAccess {
     initialDirectory: initialDirectory,
   );
 
+  /// Selects authorized folder sources through the registered platform adapter.
+  static Future<List<FolderMountSource>> pickWorkspaceDirectories({
+    String? initialDirectory,
+  }) => OperitFolderAccessPlatform.instance.pickWorkspaceDirectories(
+    initialDirectory: initialDirectory,
+  );
+
   static Future<String?> pickDirectory({String? initialDirectory}) =>
       OperitFolderAccessPlatform.instance.pickDirectory(
         initialDirectory: initialDirectory,
@@ -80,6 +90,13 @@ abstract class OperitFolderAccessPlatform {
     final path = await pickDirectory(initialDirectory: initialDirectory);
     return path == null ? null : FolderMountSource.native(path);
   }
+
+  /// Converts native directory selections into explicit mount sources.
+  Future<List<FolderMountSource>> pickWorkspaceDirectories({
+    String? initialDirectory,
+  }) async => (await pickDirectories(
+    initialDirectory: initialDirectory,
+  )).map(FolderMountSource.native).toList(growable: false);
 
   Future<List<String>> pickDirectories({String? initialDirectory});
 }
@@ -126,6 +143,17 @@ class OperitFolderAccessAndroid extends _FileSelectorFolderAccess {
 
   static void registerWith() {
     OperitFolderAccessPlatform.instance = OperitFolderAccessAndroid();
+  }
+
+  /// Retains the SAF authorization returned by Android's single-tree selector.
+  @override
+  Future<List<FolderMountSource>> pickWorkspaceDirectories({
+    String? initialDirectory,
+  }) async {
+    final source = await pickWorkspaceDirectory(
+      initialDirectory: initialDirectory,
+    );
+    return source == null ? const <FolderMountSource>[] : [source];
   }
 
   @override

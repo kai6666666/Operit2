@@ -4231,6 +4231,7 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
     final dialogWidth = (viewport.width - 32).clamp(320.0, 760.0).toDouble();
     final dialogHeight = (viewport.height - 48).clamp(320.0, 700.0).toDouble();
     return Dialog(
+      constraints: BoxConstraints(maxWidth: dialogWidth),
       insetPadding: const EdgeInsets.all(16),
       child: SizedBox(
         width: dialogWidth,
@@ -7165,7 +7166,6 @@ String _providerTypeLocalName(AppLocalizations l10n, String providerTypeId) {
     'DEEPSEEK' => l10n.settingsModelProviderTypeDeepseek,
     'MISTRAL' => l10n.settingsModelProviderTypeMistral,
     'SILICONFLOW' => l10n.settingsModelProviderTypeSiliconflow,
-    'IFLOW' => l10n.settingsModelProviderTypeIflow,
     'OPENROUTER' => l10n.settingsModelProviderTypeOpenrouter,
     'OPENCODE' => l10n.settingsModelProviderTypeOpencode,
     'FOUR_ROUTER' => l10n.settingsModelProviderTypeFourRouter,

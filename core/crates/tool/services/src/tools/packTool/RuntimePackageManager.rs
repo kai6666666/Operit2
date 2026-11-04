@@ -46,7 +46,7 @@ use crate::tools::ToolResultDataClasses::stringResultData;
 use crate::ConversationMarkupManager::ToolResult;
 use operit_host_api::{
     FileSystemHost, HostEnvironmentDescriptor, HostManager::HostManager, HostPlatform,
-    TimeUtils::currentTimeMillis,
+    TimeUtils::{currentLocalDateTime, currentTimeMillis},
 };
 use operit_plugin_sdk::javascript::{
     JsToolPkgWasmRequest, JsToolPkgWasmResult, ToolPkgConfigScope, ToolPkgExecutionContext,
@@ -80,7 +80,6 @@ use operit_util::AppLogger::AppLogger;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const REMOVED_BUILTIN_PACKAGE_ASSETS_KEY: &str = "removed_builtin_package_assets";
 const MARKET_TOOLPKG_INSTALLATION_ID_KEY: &str = "toolpkg_market_installation_id";
 const TOOLPKG_CACHE_SIGNATURE_FILE: &str = ".toolpkg-cache-signature";
 const MARKET_TOOLPKG_FILE_PREFIX: &str = "market-";
@@ -268,11 +267,11 @@ struct ExternalPackageScanCacheEntry {
 /// Manages JavaScript packages, ToolPkg containers, MCP packages, and package UI resources.
 pub struct RuntimePackageManager {
     pluginPackageManager: PluginPackageManager,
-    cachedMcpTools: BTreeMap<String, Vec<CachedMcpToolInfo>>,
-    externalPackageScanCache: BTreeMap<String, ExternalPackageScanCacheEntry>,
-    bundledExternalPackageScanCache: BTreeMap<String, ExternalPackageScanCacheEntry>,
-    toolPkgLoadIssues: Vec<ToolPkgLoadIssue>,
-    manualToolPkgLoadIssues: Vec<ToolPkgLoadIssue>,
+    cachedMcpTools: Arc<BTreeMap<String, Vec<CachedMcpToolInfo>>>,
+    externalPackageScanCache: Arc<BTreeMap<String, ExternalPackageScanCacheEntry>>,
+    bundledExternalPackageScanCache: Arc<BTreeMap<String, ExternalPackageScanCacheEntry>>,
+    toolPkgLoadIssues: Arc<Vec<ToolPkgLoadIssue>>,
+    manualToolPkgLoadIssues: Arc<Vec<ToolPkgLoadIssue>>,
     toolPkgCacheLock: Arc<Mutex<()>>,
     toolPkgTextResourceCache: Arc<ToolPkgTextResourceCache>,
     packageRegistryReadiness: PackageRegistryReadiness,
@@ -282,7 +281,7 @@ pub struct RuntimePackageManager {
     dataStore: CoreNodeStateStore,
     storePaths: RuntimeStorePaths,
     fileSystemHost: Arc<dyn FileSystemHost>,
-    context: HostManager,
+    context: Arc<HostManager>,
     toolHandler: crate::tools::AIToolHandler::AIToolHandler,
     mcpManager: MCPManager,
 }
@@ -315,11 +314,11 @@ impl RuntimePackageManager {
                     hostEnvironment: context.hostEnvironment.clone(),
                 }),
             ),
-            cachedMcpTools: BTreeMap::new(),
-            externalPackageScanCache: BTreeMap::new(),
-            bundledExternalPackageScanCache: BTreeMap::new(),
-            toolPkgLoadIssues: Vec::new(),
-            manualToolPkgLoadIssues: Vec::new(),
+            cachedMcpTools: Arc::new(BTreeMap::new()),
+            externalPackageScanCache: Arc::new(BTreeMap::new()),
+            bundledExternalPackageScanCache: Arc::new(BTreeMap::new()),
+            toolPkgLoadIssues: Arc::new(Vec::new()),
+            manualToolPkgLoadIssues: Arc::new(Vec::new()),
             toolPkgCacheLock: Arc::new(Mutex::new(())),
             toolPkgTextResourceCache: Arc::new(ToolPkgTextResourceCache::default()),
             packageRegistryReadiness: PackageRegistryReadiness::new(),
@@ -341,7 +340,7 @@ impl RuntimePackageManager {
             storePaths: paths,
             fileSystemHost,
             mcpManager: MCPManager::getInstance(context.clone()),
-            context,
+            context: Arc::new(context),
             toolHandler,
         };
         manager
@@ -440,6 +439,29 @@ impl RuntimePackageManager {
         methodName: &str,
         payload: serde_json::Value,
     ) -> impl Future<Output = Result<serde_json::Value, String>> + 'static {
+        self.invokeToolPkgPublicApiWithDeadline(packageName, methodName, payload, None)
+    }
+
+    /// Calls a public API with an engine-enforced deadline covering synchronous and asynchronous script execution.
+    #[allow(non_snake_case)]
+    pub fn invokeToolPkgPublicApiWithTimeoutMillis(
+        &self,
+        packageName: &str,
+        methodName: &str,
+        payload: serde_json::Value,
+        timeoutMillis: u64,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + 'static {
+        self.invokeToolPkgPublicApiWithDeadline(packageName, methodName, payload, Some(timeoutMillis))
+    }
+
+    #[allow(non_snake_case)]
+    fn invokeToolPkgPublicApiWithDeadline(
+        &self,
+        packageName: &str,
+        methodName: &str,
+        payload: serde_json::Value,
+        timeoutMillis: Option<u64>,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + 'static {
         let startedAt = currentTimeMillis();
         let manager = self.toolPkgManager().clone();
         let reader = self.resourceReader();
@@ -464,8 +486,7 @@ impl RuntimePackageManager {
                 payload,
                 callerPackage: "host".to_string(),
             };
-            let serde_json::Value::Object(event) =
-                serde_json::to_value(event).map_err(|error| error.to_string())?
+            let serde_json::Value::Object(event) = serde_json::to_value(event).map_err(|error| error.to_string())?
             else {
                 return Err("ToolPkg public API event must serialize to an object".to_string());
             };
@@ -509,25 +530,45 @@ impl RuntimePackageManager {
                 );
             }
             let executeAt = currentTimeMillis();
-            let result = engine
-                .execute_script_function_async(
-                    script,
-                    declaration.function.clone(),
-                    params,
-                    BTreeMap::new(),
-                    None,
-                    true,
-                    60_000,
-                )
-                .await;
+            let result = match timeoutMillis {
+                Some(timeout) => {
+                    engine
+                        .execute_script_function_with_timeout_millis(
+                            &script,
+                            &declaration.function,
+                            &params,
+                            &BTreeMap::new(),
+                            None,
+                            true,
+                            timeout,
+                        )
+                        .await
+                }
+                None => {
+                    engine
+                        .execute_script_function_async(
+                            script,
+                            declaration.function.clone(),
+                            params,
+                            BTreeMap::new(),
+                            None,
+                            true,
+                        )
+                        .await
+                }
+            };
             let completedAt = currentTimeMillis();
             AppLogger::v_with_level(
                 "ToolPkgTiming",
                 &format!(
                     "kind=public_api package={} function={} api={} prepareMs={} executeMs={} totalMs={} success={}",
-                    runtime.packageName, declaration.function, apiName,
-                    executeAt.saturating_sub(startedAt), completedAt.saturating_sub(executeAt),
-                    completedAt.saturating_sub(startedAt), result.is_ok(),
+                    runtime.packageName,
+                    declaration.function,
+                    apiName,
+                    executeAt.saturating_sub(startedAt),
+                    completedAt.saturating_sub(executeAt),
+                    completedAt.saturating_sub(startedAt),
+                    result.is_ok(),
                 ),
                 operit_util::AppLogger::VERBOSE_LEVEL_3,
             );
@@ -990,22 +1031,26 @@ impl RuntimePackageManager {
     }
 
     #[allow(non_snake_case)]
-    /// Returns package names enabled in preferences after applying disabled package records.
+    /// Projects enabled packages from container activation and each child's declared state.
     #[operit_route_macros::operit_plugin_sdk_expose]
     pub fn getEnabledPackageNames(&self) -> Vec<String> {
         let availablePackages = self.availablePackages();
+        let subpackages = self.toolPkgSubpackageByPackageNameInternal();
         let mut enabledPackageNames = self
             .decodeEnabledPackageNamesFromPrefs()
             .into_iter()
-            .filter(|packageName| availablePackages.contains_key(packageName))
+            .filter(|name| availablePackages.contains_key(name) && !subpackages.contains_key(name))
             .collect::<BTreeSet<_>>();
         let disabledPackageNames = BTreeSet::from_iter(self.decodeDisabledPackageNamesFromPrefs());
-        for toolPackage in self.availablePackages().values() {
-            if toolPackage.is_built_in
-                && toolPackage.enabled_by_default
-                && !disabledPackageNames.contains(&toolPackage.name)
-            {
-                enabledPackageNames.insert(toolPackage.name.clone());
+        for package in availablePackages.values().filter(|package| !subpackages.contains_key(&package.name)) {
+            if package.is_built_in && package.enabled_by_default && !disabledPackageNames.contains(&package.name) {
+                enabledPackageNames.insert(package.name.clone());
+            }
+        }
+        let states = self.getToolPkgSubpackageStatesInternal();
+        for child in subpackages.values() {
+            if enabledPackageNames.contains(&child.containerPackageName) && states[&child.packageName] {
+                enabledPackageNames.insert(child.packageName.clone());
             }
         }
         enabledPackageNames.into_iter().collect()
@@ -1016,27 +1061,20 @@ impl RuntimePackageManager {
         BTreeSet::from_iter(self.getEnabledPackageNames())
     }
 
+    /// Applies persisted child preferences to their manifest-declared initial states.
     #[allow(non_snake_case)]
     pub(crate) fn getToolPkgSubpackageStatesInternal(&self) -> BTreeMap<String, bool> {
-        self.normalizeToolPkgSubpackageStates(&self.decodeToolPkgSubpackageStatesFromPrefs())
+        let mut states: BTreeMap<_, _> = self.toolPkgSubpackageByPackageNameInternal()
+            .into_iter().map(|(name, child)| (name, child.enabledByDefault)).collect();
+        states.extend(self.normalizeToolPkgSubpackageStates(&self.decodeToolPkgSubpackageStatesFromPrefs()));
+        states
     }
 
     #[allow(non_snake_case)]
-    /// Returns whether a package is enabled and not disabled by ToolPkg subpackage state.
+    /// Returns the package's effective state from the shared enabled-package projection.
     #[operit_route_macros::operit_plugin_sdk_expose]
     pub fn isPackageEnabled(&self, packageName: &str) -> bool {
-        let normalizedPackageName = self.normalizePackageName(packageName);
-        let enabledPackageSet = self.getEnabledPackageNameSetInternal();
-        if !enabledPackageSet.contains(&normalizedPackageName) {
-            return false;
-        }
-        if let Some(subpackageRuntime) = self
-            .toolPkgManager()
-            .resolveToolPkgSubpackageRuntimeInternal(&normalizedPackageName)
-        {
-            return enabledPackageSet.contains(&subpackageRuntime.containerPackageName);
-        }
-        true
+        self.getEnabledPackageNameSetInternal().contains(&self.normalizePackageName(packageName))
     }
 
     #[allow(non_snake_case)]
@@ -1074,30 +1112,10 @@ impl RuntimePackageManager {
         {
             let containerAlreadyEnabled = enabledPackageNames.contains(&normalizedPackageName);
             enabledPackageNames.insert(normalizedPackageName.clone());
-            for subpackage in &containerRuntime.subpackages {
-                let shouldEnable = subpackageStates
-                    .get(&subpackage.packageName)
-                    .copied()
-                    .unwrap_or(subpackage.enabledByDefault);
-                subpackageStates
-                    .entry(subpackage.packageName.clone())
-                    .or_insert(shouldEnable);
-                if shouldEnable {
-                    enabledPackageNames.insert(subpackage.packageName.clone());
-                } else {
-                    enabledPackageNames.remove(&subpackage.packageName);
-                }
-            }
             let names = enabledPackageNames.into_iter().collect::<Vec<_>>();
             if let Err(error) = self.saveEnabledPackageNames(&names) {
                 return format!(
                     "Failed to enable ToolPkg container '{}': {}",
-                    normalizedPackageName, error
-                );
-            }
-            if let Err(error) = self.saveToolPkgSubpackageStates(&subpackageStates) {
-                return format!(
-                    "Failed to save ToolPkg subpackage states '{}': {}",
                     normalizedPackageName, error
                 );
             }
@@ -1126,7 +1144,6 @@ impl RuntimePackageManager {
             .resolveToolPkgSubpackageRuntimeInternal(&normalizedPackageName)
         {
             enabledPackageNames.insert(subpackageRuntime.containerPackageName.clone());
-            enabledPackageNames.insert(normalizedPackageName.clone());
             subpackageStates.insert(normalizedPackageName.clone(), true);
             let names = enabledPackageNames.into_iter().collect::<Vec<_>>();
             if let Err(error) = self.saveEnabledPackageNames(&names) {
@@ -1211,12 +1228,6 @@ impl RuntimePackageManager {
                     normalizedPackageName, error
                 );
             }
-            if let Err(error) = self.saveToolPkgSubpackageStates(&subpackageStates) {
-                return format!(
-                    "Failed to save ToolPkg subpackage states '{}': {}",
-                    normalizedPackageName, error
-                );
-            }
             if let Err(error) = self.addToDisabledIfDefaultEnabled(&normalizedPackageName) {
                 return format!(
                     "Failed to disable ToolPkg container '{}': {}",
@@ -1247,13 +1258,6 @@ impl RuntimePackageManager {
             let packageWasRemoved = enabledPackageNames.remove(&normalizedPackageName);
             subpackageStates.insert(normalizedPackageName.clone(), false);
             self.unregisterPackageTools(&normalizedPackageName);
-            let names = enabledPackageNames.into_iter().collect::<Vec<_>>();
-            if let Err(error) = self.saveEnabledPackageNames(&names) {
-                return format!(
-                    "Failed to disable ToolPkg subpackage '{}': {}",
-                    normalizedPackageName, error
-                );
-            }
             if let Err(error) = self.saveToolPkgSubpackageStates(&subpackageStates) {
                 return format!(
                     "Failed to save ToolPkg subpackage states '{}': {}",
@@ -1296,7 +1300,7 @@ impl RuntimePackageManager {
     }
 
     #[allow(non_snake_case)]
-    /// Removes custom code from built-in identities or deletes ordinary external packages.
+    /// Removes custom code from built-in identities or deletes the selected package installation.
     pub fn deletePackage(&mut self, packageName: &str) -> bool {
         let name = match self
             .toolPkgManager()
@@ -1325,9 +1329,6 @@ impl RuntimePackageManager {
             }
             self.loadAvailablePackages();
             return true;
-        }
-        if record.settings["builtin"] == true {
-            return false;
         }
         self.disablePackage(&name);
         if let Err(error) = ExtensionStore::default().delete("package", &name) {
@@ -1381,32 +1382,6 @@ impl RuntimePackageManager {
             && owner
                 .as_ref()
                 .is_some_and(|name| self.availablePackages().contains_key(name));
-        // Shared removals are represented by their synchronized installation tombstone.
-        // Only device-local or unreadable assets need a local retirement preference.
-        let builtinAsset = if sourceOnly {
-            None
-        } else {
-            self.toolHandler
-                .runtimeSupport()
-                .builtinPluginAssets()
-                .iter()
-                .find(|asset| {
-                    asset.name == issue.sourcePath
-                        || owner.as_ref().is_some_and(|name| {
-                            Self::packageNameFromScanResult(
-                                &self.parseBuiltInPackageAsset(asset),
-                            )
-                            .as_ref()
-                                == Some(name)
-                        })
-                })
-                .filter(|asset| {
-                    self.parseBuiltInPackageAsset(asset).toolPkgLoadResult.as_ref()
-                        .and_then(|load| load.containerRuntime.manifestExtensions.get("installation_scope"))
-                        .and_then(serde_json::Value::as_str) != Some("space")
-                })
-                .map(|asset| asset.name.to_string())
-        };
         let mut removed = false;
         if let Some(name) = owner.as_deref().filter(|_| !sourceOnly) {
             self.disablePackage(name);
@@ -1425,19 +1400,6 @@ impl RuntimePackageManager {
                     .map_err(|error| error.to_string())?;
                 removed = true;
             }
-        }
-        if let Some(assetName) = builtinAsset {
-            let mut retired = self.removedBuiltinPackageAssets();
-            retired.insert(assetName);
-            self.dataStore
-                .edit(|preferences| {
-                    preferences.set(
-                        &stringPreferencesKey(REMOVED_BUILTIN_PACKAGE_ASSETS_KEY),
-                        serde_json::to_value(&retired).expect("asset names are serializable"),
-                    );
-                })
-                .map_err(|error| error.to_string())?;
-            removed = true;
         }
         if !removed {
             return Err("No installed package source was found for this load issue".into());
@@ -1541,24 +1503,16 @@ impl RuntimePackageManager {
     }
 
     #[allow(non_snake_case)]
-    /// Orders active ToolPkg runtimes exactly as persisted by the user.
+    /// Orders Space containers before device containers, preserving user order within each scope.
     fn orderToolPkgRuntimes(
         &self,
         mut runtimes: Vec<ToolPkgContainerRuntime>,
     ) -> Vec<ToolPkgContainerRuntime> {
-        let storedOrder = self.decodeToolPkgContainerOrderFromPrefs();
-        let mut byName = runtimes
-            .drain(..)
-            .map(|runtime| (runtime.packageName.clone(), runtime))
-            .collect::<BTreeMap<_, _>>();
-        let mut ordered = Vec::new();
-        for packageName in storedOrder {
-            if let Some(runtime) = byName.remove(&packageName) {
-                ordered.push(runtime);
-            }
-        }
-        ordered.extend(byName.into_values());
-        ordered
+        let ranks = self.decodeToolPkgContainerOrderFromPrefs().into_iter()
+            .enumerate().map(|(rank, name)| (name, rank)).collect::<BTreeMap<_, _>>();
+        runtimes.sort_by_key(|runtime| *ranks.get(&runtime.packageName)
+            .expect("Registered ToolPkg container must have an owner rank"));
+        runtimes
     }
 
     #[allow(non_snake_case)]
@@ -1572,7 +1526,7 @@ impl RuntimePackageManager {
             .enumerate()
             .map(|(index, packageName)| (packageName, index))
             .collect::<BTreeMap<_, _>>();
-        let runtimes = self.toolPkgManager().getToolPkgContainerRuntimes();
+        let runtimes = self.orderToolPkgRuntimes(self.toolPkgManager().getToolPkgContainerRuntimes());
         runtimes
             .into_iter()
             .map(|runtime| self.withToolPkgDependencyIssues(runtime, &enabledPackageNames, &order))
@@ -1580,27 +1534,15 @@ impl RuntimePackageManager {
     }
 
     #[allow(non_snake_case)]
-    /// Returns the persisted visual order of ToolPkg containers followed by newly discovered containers.
+    /// Returns the same scope and user order used for plugin execution.
     #[operit_route_macros::operit_plugin_sdk_expose]
     pub fn getToolPkgContainerOrder(&self) -> Vec<String> {
-        let stored = self.decodeToolPkgContainerOrderFromPrefs();
-        let mut installed = self.toolPkgManager().getToolPkgContainerRuntimes();
-        let mut byName = installed
-            .drain(..)
-            .map(|runtime| (runtime.packageName.clone(), runtime))
-            .collect::<BTreeMap<_, _>>();
-        let mut ordered = Vec::new();
-        for packageName in stored {
-            if let Some(runtime) = byName.remove(&packageName) {
-                ordered.push(runtime.packageName);
-            }
-        }
-        ordered.extend(byName.into_values().map(|runtime| runtime.packageName));
-        ordered
+        self.orderToolPkgRuntimes(self.toolPkgManager().getToolPkgContainerRuntimes())
+            .into_iter().map(|runtime| runtime.packageName).collect()
     }
 
     #[allow(non_snake_case)]
-    /// Persists the complete visual order of ToolPkg containers.
+    /// Persists independent user ranks for Space and device containers.
     #[operit_route_macros::operit_plugin_sdk_expose]
     pub fn setToolPkgContainerOrder(
         &self,
@@ -1626,11 +1568,15 @@ impl RuntimePackageManager {
             }
         }
         let result = (|| -> Result<(), PreferencesDataStoreError> {
-            for (rank, name) in ordered.iter().enumerate() {
+            let mut ranks = BTreeMap::from([("space", 0usize), ("device", 0usize)]);
+            for name in &ordered {
                 let mut record = ExtensionStore::default()
                     .record("package", name)
                     .map_err(PreferencesDataStoreError::Message)?;
-                record.settings["order"] = serde_json::json!(rank);
+                let rank = ranks.get_mut(record.scope.as_str())
+                    .expect("Registered package must have a valid scope");
+                record.settings["order"] = serde_json::json!(*rank);
+                *rank += 1;
                 self.writeScopeSettings(name, record.settings)
                     .map_err(PreferencesDataStoreError::Message)?;
             }
@@ -1708,6 +1654,7 @@ impl RuntimePackageManager {
                         dialog: item.dialog.map(|dialog| {
                             operit_plugin_sdk::toolpkg::ToolPkgPackageModels::ToolPkgChatMessageMenuDialog {
                                 screen: dialog.screen,
+                                screenExport: dialog.screenExport,
                                 title: dialog.title.resolve(useEnglish),
                             }
                         }),
@@ -1763,11 +1710,16 @@ impl RuntimePackageManager {
                 eventPayload: serde_json::json!({"action": "click", "chatId": chatId,
                     "messageIndex": messageIndex, "menuItemId": item.id, "message": message}),
                 executionContextKey: None, runtimeKind: None, envOverrides: BTreeMap::new(),
-                timestampMs: currentTimeMillis(), timeoutMillis: 60_000,
+                timestampMs: currentTimeMillis(), timeoutMillis: None,
                 dispatchIntermediateOnMain: true, onIntermediateResult: None,
             })
         })();
-        async move { manager.dispatchToolPkgHook(&enabled, prepared?).await }
+        async move {
+            manager
+                .dispatchToolPkgHook(&enabled, prepared?)
+                .await
+                .map_err(|error| error.to_string())
+        }
     }
 
     #[allow(non_snake_case)]
@@ -1899,7 +1851,7 @@ impl RuntimePackageManager {
             runtimeKind: None,
             envOverrides: BTreeMap::new(),
             timestampMs: currentTimeMillis(),
-            timeoutMillis: 60_000,
+            timeoutMillis: None,
             dispatchIntermediateOnMain: true,
             onIntermediateResult: None,
         };
@@ -1916,7 +1868,8 @@ impl RuntimePackageManager {
             }
             let raw = manager
                 .dispatchToolPkgHook(&enabled, invocation)
-                .await?
+                .await
+                .map_err(|error| error.to_string())?
                 .ok_or_else(|| format!("plugin command /{} returned no result", info.name))?;
             serde_json::from_str::<ToolPkgCoreCommandExecutionResult>(&raw).map_err(|error| {
                 format!(
@@ -2028,7 +1981,7 @@ impl RuntimePackageManager {
                     runtimeKind: None,
                     envOverrides: BTreeMap::new(),
                     timestampMs: currentTimeMillis(),
-                    timeoutMillis: 60_000,
+                    timeoutMillis: None,
                     dispatchIntermediateOnMain: true,
                     onIntermediateResult: None,
                 };
@@ -2038,7 +1991,10 @@ impl RuntimePackageManager {
                 &format!("Navigation action started: {actionContext}"),
                 operit_util::AppLogger::VERBOSE_LEVEL_2,
             );
-            let result = manager.dispatchToolPkgHookAsync(&enabled, invocation).await;
+            let result = manager
+                .dispatchToolPkgHookAsync(&enabled, invocation)
+                .await
+                .map_err(|error| error.to_string());
             match &result {
                 Ok(_) => AppLogger::v_with_level(
                     PACKAGE_MANAGER_LOG_TAG,
@@ -2055,19 +2011,27 @@ impl RuntimePackageManager {
     }
 
     #[allow(non_snake_case)]
-    /// Lists bundled external standalone packages that are not currently loaded.
+    /// Lists bundled packages available for installation or an explicit source update.
     pub fn getBundledExternalPackageCandidates(&mut self) -> Vec<BundledExternalPackageCandidate> {
-        let loadedPackageNames = self
-            .availablePackages()
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let mut candidates = self
-            .scanBundledExternalPackageCandidates()
+        let scanned = self.scanBundledExternalPackageCandidates();
+        let mut candidates = Vec::new();
+        for candidate in scanned
             .into_iter()
             .filter_map(Self::bundledExternalPackageCandidateFromScanResult)
-            .filter(|candidate| !loadedPackageNames.contains(&candidate.packageName))
-            .collect::<Vec<_>>();
+        {
+            match self.bundledCandidateNeedsInstallation(&candidate) {
+                Ok(true) => candidates.push(candidate),
+                Ok(false) => {}
+                Err(error) => {
+                    self.recordAndReturnPackageError(
+                        &candidate.sourcePath,
+                        "bundled_update_check_failed",
+                        &error,
+                        &candidate.packageKind,
+                    );
+                }
+            }
+        }
         candidates.sort_by(|left, right| {
             left.displayName
                 .resolve(false)
@@ -2075,6 +2039,43 @@ impl RuntimePackageManager {
                 .then_with(|| left.packageName.cmp(&right.packageName))
         });
         candidates
+    }
+
+    /// Compares the installed source with its bundled asset without replacing custom implementations.
+    fn bundledCandidateNeedsInstallation(
+        &self,
+        candidate: &BundledExternalPackageCandidate,
+    ) -> Result<bool, String> {
+        let records = self.scopeState.lock().map_err(|error| error.to_string())?;
+        let Some(record) = records.get(&candidate.packageName) else {
+            return Ok(true);
+        };
+        if record.settings["builtin"] == true || record.settings["customized"] == true {
+            return Ok(false);
+        }
+        if record.sourceName != candidate.sourceFileName {
+            return Ok(false);
+        }
+        let root = ExtensionStore::root("package", &record.scope)?;
+        let path = self
+            .storePaths
+            .runtime_storage_path(&root)
+            .join(&record.sourceName);
+        let installed = self
+            .fileSystemHost
+            .readFileBytes(&hostPath(&path))
+            .map_err(|error| {
+                format!(
+                    "Cannot read installed package {}: {error}",
+                    candidate.packageName
+                )
+            })?;
+        let asset = bundledExternalPluginAssetByName(
+            self.toolHandler.runtimeSupport().as_ref(),
+            &candidate.sourcePath,
+        )
+        .ok_or_else(|| format!("Bundled package asset not found: {}", candidate.sourcePath))?;
+        Ok(installed.as_slice() != asset.bytes)
     }
 
     #[allow(non_snake_case)]
@@ -2145,7 +2146,7 @@ impl RuntimePackageManager {
         )
     }
 
-    /// Imports a bundled asset into the scope declared by its manifest.
+    /// Updates an existing installation in its scope or installs into the manifest scope.
     #[allow(non_snake_case)]
     fn importBundledExternalPackageCandidate(
         &mut self,
@@ -2169,7 +2170,12 @@ impl RuntimePackageManager {
                 packageKind,
             );
         };
-        let scope = match Self::bundledCandidateScope(&result.toolPkgLoadResult) {
+        let sourceFileName = packageSourceFileName(&sourcePath);
+        let scope = match self.bundledInstallationScope(
+            packageName,
+            &sourceFileName,
+            &result.toolPkgLoadResult,
+        ) {
             Ok(scope) => scope,
             Err(error) => {
                 return self.recordAndReturnPackageError(
@@ -2180,7 +2186,6 @@ impl RuntimePackageManager {
                 )
             }
         };
-        let sourceFileName = packageSourceFileName(&sourcePath);
         let packagesDir = self.storePaths.runtime_storage_path(
             &ExtensionStore::root("package", scope.as_str()).expect("Validated package scope"),
         );
@@ -2245,10 +2250,14 @@ impl RuntimePackageManager {
                 packageKind,
             );
         }
-        self.externalPackageScanCache
+        Arc::make_mut(&mut self.externalPackageScanCache)
             .remove(&destinationFile.to_string_lossy().to_string());
         self.loadAvailablePackages();
-        format!("Successfully imported package: {}\nStored at: {}", packageName, destinationFile.to_string_lossy())
+        format!(
+            "Successfully imported package: {}\nStored at: {}",
+            packageName,
+            destinationFile.to_string_lossy()
+        )
     }
 
     #[allow(non_snake_case)]
@@ -2281,6 +2290,12 @@ impl RuntimePackageManager {
     }
 
     #[allow(non_snake_case)]
+    /// Resolves one executable without materializing the complete effective package.
+    pub(crate) fn selectPackageTool(&self, packageName: &str, functionName: &str)
+        -> Result<operit_plugin_sdk::package::PackageTool, String> {
+        self.pluginPackageManager.effectiveTool(packageName, functionName)
+    }
+
     /// Returns raw package tool metadata by package name.
     #[operit_route_macros::operit_plugin_sdk_expose]
     pub fn getPackageTools(&self, packageName: &str) -> Option<ToolPackage> {
@@ -2313,7 +2328,7 @@ impl RuntimePackageManager {
     /// Returns every package load or import issue currently shown by the manager.
     #[operit_route_macros::operit_plugin_sdk_expose]
     pub fn getToolPkgLoadIssues(&self) -> Vec<ToolPkgLoadIssue> {
-        let mut issues = self.toolPkgLoadIssues.clone();
+        let mut issues = self.toolPkgLoadIssues.as_ref().clone();
         for entry in self.bundledExternalPackageScanCache.values() {
             appendUniqueToolPkgLoadIssues(&mut issues, &entry.result.issues);
         }
@@ -2343,13 +2358,13 @@ impl RuntimePackageManager {
             message.to_string(),
             packageKind,
         );
-        appendUniqueToolPkgLoadIssues(&mut self.manualToolPkgLoadIssues, &[issue]);
+        appendUniqueToolPkgLoadIssues(Arc::make_mut(&mut self.manualToolPkgLoadIssues), &[issue]);
     }
 
     /// Removes manual import issues resolved by a successful package operation.
     #[allow(non_snake_case)]
     fn clearManualToolPkgLoadIssues(&mut self, sourcePath: &str, packageName: Option<&str>) {
-        self.manualToolPkgLoadIssues.retain(|issue| {
+        Arc::make_mut(&mut self.manualToolPkgLoadIssues).retain(|issue| {
             issue.sourcePath != sourcePath
                 && packageName.is_none_or(|name| issue.packageName.as_deref() != Some(name))
         });
@@ -2386,7 +2401,7 @@ impl RuntimePackageManager {
             .deactivatePackage(&normalizedServerName);
         self.pluginPackageManager
             .clearActivePackageState(&normalizedServerName);
-        self.cachedMcpTools.remove(&normalizedServerName);
+        Arc::make_mut(&mut self.cachedMcpTools).remove(&normalizedServerName);
         removed
     }
 
@@ -2652,23 +2667,19 @@ impl RuntimePackageManager {
     }
 
     #[allow(non_snake_case)]
-    /// Selects shared assets from installation ownership rather than local retirement preferences.
+    /// Selects bundled assets from their current installation owner.
     fn scanBuiltInPackageAssets(&self) -> PackageScanSnapshot {
         let mut results = Vec::new();
-        let retired = self.removedBuiltinPackageAssets();
         for asset in self.toolHandler.runtimeSupport().builtinPluginAssets() {
             if isProgressTrackedPackageSource(asset.name) {
                 beginPackageLoadProgress(asset.name);
             }
             let mut result = self.parseBuiltInPackageAsset(asset);
-            let selected = (|| -> Result<bool, String> {
-                if let Some(load) = &result.toolPkgLoadResult {
-                    if Self::requiredInstallationScope(&load.containerRuntime)? == Some(ToolPkgConfigScope::Space) {
-                        return ExtensionStore::default().acceptsSharedBuiltinPackage(&load.containerRuntime.packageName);
-                    }
-                }
-                Ok(!retired.contains(asset.name))
-            })();
+            let packageName = Self::packageNameFromScanResult(&result);
+            let selected = match packageName.as_deref() {
+                Some(name) => ExtensionStore::default().acceptsBuiltinPackage(name),
+                None => Ok(true),
+            };
             match selected {
                 Ok(false) => continue,
                 Ok(true) => {}
@@ -2676,7 +2687,7 @@ impl RuntimePackageManager {
                     result.toolPackage = None;
                     result.toolPkgLoadResult = None;
                     result.issues.push(newToolPkgLoadIssue(
-                        asset.name.to_string(), None, packageProgressDisplayName(asset.name),
+                        asset.name.to_string(), packageName, packageProgressDisplayName(asset.name),
                         "scope_failed", error, "package",
                     ));
                 }
@@ -2804,7 +2815,7 @@ impl RuntimePackageManager {
             );
             results.push(result);
         }
-        self.externalPackageScanCache = nextCache;
+        self.externalPackageScanCache = Arc::new(nextCache);
         self.mergePackageScanCandidateResults(results, Some(baseSnapshot))
     }
 
@@ -2835,25 +2846,11 @@ impl RuntimePackageManager {
             );
             results.push(result);
         }
-        self.bundledExternalPackageScanCache = nextCache;
+        self.bundledExternalPackageScanCache = Arc::new(nextCache);
         results
     }
 
-    /// Lists embedded sources explicitly retired through the failed-package dialog.
-    #[allow(non_snake_case)]
-    fn removedBuiltinPackageAssets(&self) -> BTreeSet<String> {
-        self.dataStore
-            .data()
-            .ok()
-            .and_then(|preferences| {
-                preferences
-                    .get(&stringPreferencesKey(REMOVED_BUILTIN_PACKAGE_ASSETS_KEY))
-                    .cloned()
-            })
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_default()
-    }
-
+    /// Scans optional bundled archives for explicit installation.
     #[allow(non_snake_case)]
     fn scanBundledExternalToolPkgCandidates(&mut self) -> Vec<PackageScanCandidateResult> {
         self.scanBundledExternalPackageCandidates()
@@ -3400,9 +3397,6 @@ impl RuntimePackageManager {
                     .map(Self::requiredInstallationScope)
                     .transpose()?
                     .flatten();
-                if let Some(required) = requiredScope {
-                    store.reconcileBuiltinScopeDuplicates("package", name, required.as_str())?;
-                }
                 let existing = store
                     .records("package")?
                     .into_iter()
@@ -3460,10 +3454,31 @@ impl RuntimePackageManager {
                         return Err(format!("Package location conflicts with its owner: {name}"));
                     }
                 }
-                let currentMembers = serde_json::to_value(members).map_err(|error| error.to_string())?;
-                if record.settings["members"] != currentMembers {
-                    record.settings["members"] = currentMembers;
-                    store.setSettings("package", name, record.settings.clone())?;
+                let declaredEnvironment = members.iter()
+                    .filter_map(|member| snapshot.availablePackages.get(member))
+                    .flat_map(|package| package.env.iter().map(|variable| variable.name.clone()))
+                    .collect::<Vec<_>>();
+                store.initializePackageEnvironment(name, &declaredEnvironment)?;
+                let mut settings = record.settings.clone();
+                settings["members"] =
+                    serde_json::to_value(members).map_err(|error| error.to_string())?;
+                let fields = settings
+                    .as_object_mut()
+                    .ok_or("Package settings must be an object")?;
+                match requiredScope {
+                    Some(scope) => {
+                        fields.insert(
+                            "installationScope".into(),
+                            serde_json::to_value(scope).map_err(|error| error.to_string())?,
+                        );
+                    }
+                    None => {
+                        fields.remove("installationScope");
+                    }
+                }
+                if record.settings != settings {
+                    store.setSettings("package", name, settings.clone())?;
+                    record.settings = settings;
                 }
                 self.scopeState
                     .lock()
@@ -3507,7 +3522,7 @@ impl RuntimePackageManager {
             .replaceAvailablePackages(snapshot.availablePackages);
         self.pluginPackageManager
             .replaceToolPkgRuntimes(snapshot.toolPkgContainers, snapshot.toolPkgSubpackages);
-        self.toolPkgLoadIssues = snapshot.toolPkgLoadIssues;
+        self.toolPkgLoadIssues = Arc::new(snapshot.toolPkgLoadIssues);
     }
 
     #[allow(non_snake_case)]
@@ -3692,6 +3707,51 @@ impl RuntimePackageManager {
         )
     }
 
+    /// Validates source ownership and manifest restrictions before writing an installed update.
+    fn bundledInstallationScope(
+        &self,
+        packageName: &str,
+        sourceFileName: &str,
+        loadResult: &Option<ToolPkgLoadResult>,
+    ) -> Result<ToolPkgConfigScope, String> {
+        let records = self.scopeState.lock().map_err(|error| error.to_string())?;
+        let Some(record) = records.get(packageName) else {
+            return Self::bundledCandidateScope(loadResult);
+        };
+        if record.settings["customized"] == true {
+            return Err(format!(
+                "Package has a custom implementation: {packageName}"
+            ));
+        }
+        if record.settings["builtin"] == true {
+            if !record.sourceName.is_empty() {
+                return Err(format!(
+                    "Built-in package has an unexpected source: {packageName}"
+                ));
+            }
+        } else if record.sourceName != sourceFileName {
+            return Err(format!(
+                "Package source conflicts with installation: {packageName}"
+            ));
+        }
+        let scope = serde_json::from_value::<ToolPkgConfigScope>(serde_json::Value::String(
+            record.scope.clone(),
+        ))
+        .map_err(|error| error.to_string())?;
+        let requiredScope = loadResult
+            .as_ref()
+            .map(|loaded| Self::requiredInstallationScope(&loaded.containerRuntime))
+            .transpose()?
+            .flatten();
+        if requiredScope.is_some_and(|required| required != scope) {
+            return Err(format!(
+                "Package {packageName} cannot be updated in {} scope",
+                scope.as_str()
+            ));
+        }
+        Ok(scope)
+    }
+
     /// Resolves the manifest restriction for a bundled asset before installation.
     fn bundledCandidateScope(
         loadResult: &Option<ToolPkgLoadResult>,
@@ -3789,7 +3849,7 @@ impl RuntimePackageManager {
             let (loadResult, loadIssues) = self
                 .loadToolPkgFromExternalFileWithIssues(&file, scope)
                 .map_err(|error| format!("Error importing package: {error}"))?;
-            appendUniqueToolPkgLoadIssues(&mut self.manualToolPkgLoadIssues, &loadIssues);
+            appendUniqueToolPkgLoadIssues(Arc::make_mut(&mut self.manualToolPkgLoadIssues), &loadIssues);
             let packageName = loadResult.containerPackage.name.clone();
             let marketOrigin = loadResult.marketOrigin.clone();
             if !self.canImportToolPkg(&loadResult)? {
@@ -3816,7 +3876,7 @@ impl RuntimePackageManager {
             let (importedLoadResult, importedLoadIssues) = self
                 .loadToolPkgFromExternalFileWithIssues(&destinationFile, scope)
                 .map_err(|error| format!("Error importing package: {error}"))?;
-            appendUniqueToolPkgLoadIssues(&mut self.manualToolPkgLoadIssues, &importedLoadIssues);
+            appendUniqueToolPkgLoadIssues(Arc::make_mut(&mut self.manualToolPkgLoadIssues), &importedLoadIssues);
             if !self.registerImportedToolPkg(importedLoadResult)? {
                 return Err(format!(
                     "A package with name '{}' already exists in available packages",
@@ -3906,7 +3966,7 @@ impl RuntimePackageManager {
             ExtensionStore::default().customizePackage(
                 &packageMetadata.name, &fileName.to_string_lossy(), vec![packageMetadata.name.clone()],
             )?;
-            self.externalPackageScanCache.remove(&hostPath(&destinationFile));
+            Arc::make_mut(&mut self.externalPackageScanCache).remove(&hostPath(&destinationFile));
             self.loadAvailablePackages();
         } else {
             self.registerScope(
@@ -4024,7 +4084,7 @@ impl RuntimePackageManager {
         self.saveEnabledPackageNames(&enabledNames)
             .map_err(|error| error.to_string())?;
         ExtensionStore::default().customizePackage(&name, &source, members)?;
-        self.externalPackageScanCache.remove(&path);
+        Arc::make_mut(&mut self.externalPackageScanCache).remove(&path);
         self.loadAvailablePackages();
         Ok(self
             .getToolPkgContainerRuntime(&name)
@@ -4352,7 +4412,7 @@ impl RuntimePackageManager {
             }
             let (preview, previewIssues) =
                 self.loadToolPkgFromMarketFileWithIssues(&stagingFile, scope)?;
-            appendUniqueToolPkgLoadIssues(&mut self.manualToolPkgLoadIssues, &previewIssues);
+            appendUniqueToolPkgLoadIssues(Arc::make_mut(&mut self.manualToolPkgLoadIssues), &previewIssues);
             let packageName = preview.containerPackage.name.clone();
             if !self.canImportToolPkg(&preview)? {
                 return Err(format!(
@@ -4375,7 +4435,7 @@ impl RuntimePackageManager {
             destinationStored = true;
             let (loaded, loadedIssues) =
                 self.loadToolPkgFromMarketFileWithIssues(&destinationFile, scope)?;
-            appendUniqueToolPkgLoadIssues(&mut self.manualToolPkgLoadIssues, &loadedIssues);
+            appendUniqueToolPkgLoadIssues(Arc::make_mut(&mut self.manualToolPkgLoadIssues), &loadedIssues);
             if !self.registerImportedToolPkg(loaded)? {
                 return Err(format!(
                     "Failed to register toolpkg '{}' due to naming conflict",
@@ -4436,7 +4496,7 @@ impl RuntimePackageManager {
     #[allow(non_snake_case)]
     /// Stores cached MCP tool descriptions for a server package.
     pub fn setCachedMcpTools(&mut self, serverName: String, tools: Vec<CachedMcpToolInfo>) {
-        self.cachedMcpTools.insert(serverName, tools);
+        Arc::make_mut(&mut self.cachedMcpTools).insert(serverName, tools);
     }
 
     #[allow(non_snake_case)]
@@ -4493,6 +4553,11 @@ impl RuntimePackageManager {
     }
 
     #[allow(non_snake_case)]
+    /// Loads a declared module while preserving enabled-container ownership checks.
+    pub fn loadToolPkgWasmModule(&self, target: &str, moduleId: &str) -> Result<operit_plugin_sdk::javascript::JsToolPkgWasmModule, String> {
+        ToolPkgPackageService::new(self).loadToolPkgWasmModule(target, moduleId, true)
+    }
+
     /// Calls one declared ToolPkg WASM export.
     pub fn callToolPkgWasm(
         &self,
@@ -4601,6 +4666,43 @@ impl RuntimePackageManager {
     }
 
     #[allow(non_snake_case)]
+    /// Executes one before hook with an explicit caller-owned completion deadline.
+    #[allow(non_snake_case)]
+    pub fn runToolPkgMainHookWithTimeoutMillis(
+        &self,
+        containerPackageName: &str,
+        functionName: &str,
+        event: &str,
+        eventName: Option<&str>,
+        pluginId: Option<&str>,
+        inlineFunctionSource: Option<&str>,
+        eventPayload: serde_json::Value,
+        executionContextKey: Option<&str>,
+        runtimeKind: Option<&str>,
+        onIntermediateResult: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+        timeoutMillis: u64,
+    ) -> operit_plugin_sdk::javascript::JsExecutionCompletion<Result<Option<String>, String>> {
+        self.runToolPkgMainHookWithDeadline(
+            containerPackageName,
+            functionName,
+            event,
+            eventName,
+            pluginId,
+            inlineFunctionSource,
+            eventPayload,
+            executionContextKey,
+            runtimeKind,
+            onIntermediateResult,
+            Some(timeoutMillis),
+        )
+    }
+
+    /// Reports the exact timed-out before hook through the active frontend and returned error.
+    #[allow(non_snake_case)]
+    pub fn reportToolPkgHookTimeout(&self, packageName: &str, hookId: &str, event: &str) -> String {
+        notifyToolPkgHookTimeout(&self.context, packageName, hookId, event)
+    }
+
     /// Runs a main hook exported by a ToolPkg container.
     pub fn runToolPkgMainHook(
         &self,
@@ -4615,7 +4717,7 @@ impl RuntimePackageManager {
         runtimeKind: Option<&str>,
         onIntermediateResult: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
     ) -> operit_plugin_sdk::javascript::JsExecutionCompletion<Result<Option<String>, String>> {
-        self.runToolPkgMainHookWithTimeoutMillis(
+        self.runToolPkgMainHookWithDeadline(
             containerPackageName,
             functionName,
             event,
@@ -4626,13 +4728,13 @@ impl RuntimePackageManager {
             executionContextKey,
             runtimeKind,
             onIntermediateResult,
-            60_000,
+            None,
         )
     }
 
     #[allow(non_snake_case)]
     /// Runs a main hook exported by a ToolPkg container with one explicit millisecond timeout.
-    pub fn runToolPkgMainHookWithTimeoutMillis(
+    fn runToolPkgMainHookWithDeadline(
         &self,
         containerPackageName: &str,
         functionName: &str,
@@ -4644,7 +4746,7 @@ impl RuntimePackageManager {
         executionContextKey: Option<&str>,
         runtimeKind: Option<&str>,
         onIntermediateResult: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
-        timeoutMillis: u64,
+        timeoutMillis: Option<u64>,
     ) -> operit_plugin_sdk::javascript::JsExecutionCompletion<Result<Option<String>, String>> {
         let startedAt = currentTimeMillis();
         let packageName = self.normalizePackageName(containerPackageName);
@@ -4670,6 +4772,8 @@ impl RuntimePackageManager {
             },
         );
         let preparedAt = currentTimeMillis();
+        let manager = self.clone();
+        let hookId = pluginId.map(str::to_owned);
         Box::pin(async move {
             let result = pending.await;
             let completedAt = currentTimeMillis();
@@ -4683,7 +4787,24 @@ impl RuntimePackageManager {
                 ),
                 operit_util::AppLogger::VERBOSE_LEVEL_3,
             );
-            result
+            match result {
+                Ok(value) => Ok(value),
+                Err(error)
+                    if error.kind
+                        == operit_plugin_sdk::execution_result::JsExecutionErrorKind::Timeout =>
+                {
+                    Err(manager.reportToolPkgHookTimeout(
+                        &packageName,
+                        &hookId.ok_or_else(|| {
+                            format!(
+                                "Timed before hook {packageName}:{timedFunction} has no Hook ID"
+                            )
+                        })?,
+                        &timedEvent,
+                    ))
+                }
+                Err(error) => Err(error.to_string()),
+            }
         })
     }
 
@@ -4731,7 +4852,7 @@ impl RuntimePackageManager {
             return format!("Cannot get MCP server configuration: {}", serverName);
         };
         let tools = crate::tools::mcp_runtime::plugins::MCPBridgeClient::MCPBridgeClient::new(
-            self.context.clone(),
+            self.context.as_ref().clone(),
             serverConfig.name.clone(),
         )
         .getTools();
@@ -4792,6 +4913,7 @@ impl RuntimePackageManager {
         let mut records = self.scopeRecords();
         records.sort_by_key(|record| {
             (
+                record.scope != "space",
                 record.settings["order"]
                     .as_u64()
                     .expect("Registered package rank must be an integer"),
@@ -4972,7 +5094,9 @@ impl RuntimePackageManager {
         &self,
         names: &[String],
     ) -> Result<(), PreferencesDataStoreError> {
-        let names = self.normalizeEnabledPackageNames(names);
+        let subpackages = self.toolPkgSubpackageByPackageNameInternal();
+        let names: Vec<_> = self.normalizeEnabledPackageNames(names).into_iter()
+            .filter(|name| !subpackages.contains_key(name)).collect();
         for mut record in self.scopeRecords() {
             let members: Vec<String> = serde_json::from_value(record.settings["members"].clone())?;
             record.settings["enabledNames"] = serde_json::to_value(
@@ -5073,7 +5197,7 @@ impl RuntimePackageManager {
     fn generatePackageSystemPrompt(&self, toolPackage: &ToolPackage) -> String {
         let mut prompt = String::new();
         prompt.push_str(&format!("Using package: {}\n", toolPackage.name));
-        prompt.push_str(&format!("Use Time: {}\n", currentUseTime()));
+        prompt.push_str(&format!("Use Time: {}\n", currentLocalDateTime()));
         prompt.push_str(&format!(
             "Description: {}\n\n",
             toolPackage.description.resolve(false)
@@ -5301,7 +5425,7 @@ impl RuntimePackageManager {
     fn generateMCPSystemPrompt(&self, toolPackage: &ToolPackage, serverName: &str) -> String {
         let mut prompt = String::new();
         prompt.push_str(&format!("Using MCP server: {}\n", serverName));
-        prompt.push_str(&format!("Time: {}\n", currentUseTime()));
+        prompt.push_str(&format!("Time: {}\n", currentLocalDateTime()));
         prompt.push_str(&format!(
             "Description: {}\n\n",
             toolPackage.description.resolve(false)
@@ -5384,12 +5508,6 @@ impl ToolPkgPackageHost for RuntimePackageManager {
         RuntimePackageManager::getEnabledPackageNameSetInternal(self)
     }
 
-    /// Returns enabled package names in stable order.
-    #[allow(non_snake_case)]
-    fn getEnabledPackageNames(&self) -> Vec<String> {
-        RuntimePackageManager::getEnabledPackageNames(self)
-    }
-
     /// Returns persisted ToolPkg subpackage states.
     #[allow(non_snake_case)]
     fn getToolPkgSubpackageStatesInternal(&self) -> BTreeMap<String, bool> {
@@ -5403,13 +5521,6 @@ impl ToolPkgPackageHost for RuntimePackageManager {
             .fileSystemHost
             .clone()
             .expect("RuntimePackageManager requires a FileSystemHost")
-    }
-
-    /// Persists enabled package names for SDK state changes.
-    #[allow(non_snake_case)]
-    fn saveEnabledPackageNames(&self, packageNames: &[String]) -> Result<(), String> {
-        RuntimePackageManager::saveEnabledPackageNames(self, packageNames)
-            .map_err(|error| error.to_string())
     }
 
     /// Persists ToolPkg subpackage states for SDK state changes.
@@ -5455,16 +5566,6 @@ impl ToolPkgPackageHost for RuntimePackageManager {
     ) -> Option<Vec<u8>> {
         RuntimePackageManager::readToolPkgResourceBytes(self, runtime, resourcePath)
     }
-}
-
-#[allow(non_snake_case)]
-/// Formats the host-provided Unix clock for package prompt metadata.
-fn currentUseTime() -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(currentTimeMillis())
-        .expect("host time must be a valid chrono timestamp")
-        .naive_utc()
-        .format("%Y-%m-%dT%H:%M:%S%.f")
-        .to_string()
 }
 
 #[allow(non_snake_case)]
@@ -6027,4 +6128,62 @@ pub(crate) fn openComposeDslSessionForContext(
     let id = session.id();
     sessions.insert(key, session);
     Ok(id)
+}
+
+/// Publishes a before-hook deadline failure and preserves presentation errors in the returned failure.
+#[allow(non_snake_case)]
+fn notifyToolPkgHookTimeout(
+    context: &HostManager,
+    packageName: &str,
+    hookId: &str,
+    event: &str,
+) -> String {
+    let message =
+        format!("前置插件「{packageName}:{hookId}」响应超时（{event}），本次 Hook 已终止。");
+    AppLogger::e("ToolPkgHookTimeout", &message);
+    let notification = context
+        .toastHost
+        .as_ref()
+        .ok_or_else(|| "Frontend Toast host is unavailable".to_string())
+        .and_then(|host| host.toast(&message).map_err(|error| error.to_string()));
+    match notification {
+        Ok(()) => format!("TOOLPKG_BEFORE_HOOK_TIMEOUT: {message}"),
+        Err(error) => format!("TOOLPKG_BEFORE_HOOK_TIMEOUT: {message} 超时提示显示失败：{error}"),
+    }
+}
+
+#[cfg(test)]
+mod hook_timeout_notification_tests {
+    use super::*;
+
+    /// Presents the exact owner and stage while returning the same terminal timeout to the caller.
+    #[test]
+    fn before_hook_timeout_is_presented_and_propagated() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let received = messages.clone();
+        let context = HostManager::new().withToastHost(Arc::new(move |message: &str| {
+            received.lock().unwrap().push(message.to_string());
+            Ok(())
+        }));
+        let error =
+            notifyToolPkgHookTimeout(&context, "bridge.wechat", "before-send", "submit_requested");
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.as_slice(), ["前置插件「bridge.wechat:before-send」响应超时（submit_requested），本次 Hook 已终止。"]);
+        assert_eq!(
+            error,
+            format!("TOOLPKG_BEFORE_HOOK_TIMEOUT: {}", messages[0])
+        );
+    }
+
+    /// Propagates a failed presenter instead of claiming that a timeout notice was displayed.
+    #[test]
+    fn before_hook_timeout_preserves_presentation_failure() {
+        let context = HostManager::new().withToastHost(Arc::new(|_message: &str| {
+            Err(operit_host_api::HostError::new("toast channel closed"))
+        }));
+        let error =
+            notifyToolPkgHookTimeout(&context, "bridge.wechat", "before-send", "submit_requested");
+        assert!(error.starts_with("TOOLPKG_BEFORE_HOOK_TIMEOUT: "));
+        assert!(error.ends_with("超时提示显示失败：toast channel closed"));
+    }
 }

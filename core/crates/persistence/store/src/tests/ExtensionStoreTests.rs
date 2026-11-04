@@ -9,8 +9,11 @@ use std::sync::Mutex;
 struct MemoryStorage {
     files: Mutex<BTreeMap<String, Vec<u8>>>,
     fail_write: Mutex<Option<String>>,
+    modified: Mutex<BTreeMap<String, i64>>,
+    journal: crate::transaction_test_host::TransactionJournalHost,
 }
 impl RuntimeStorageHost for MemoryStorage {
+    fn openTransactionDatabase(&self,path: &str) -> HostResult<Box<dyn operit_host_api::RuntimeSqliteConnection>> { self.journal.open(path) }
     /// Confirms synchronous in-memory publication without copying or rewriting bytes.
     fn flushFile(&self, path: &str) -> operit_host_api::HostResult<()> {
         if !self.exists(path)? {
@@ -43,6 +46,10 @@ impl RuntimeStorageHost for MemoryStorage {
         self.writeBytes(path, content)
     }
 
+    /// Reads the mock file's tracked modification time.
+    fn modifiedAt(&self, path: &str) -> HostResult<i64> { Ok(self.modified.lock().unwrap()[path]) }
+    /// Restores the mock file's modification time.
+    fn setModifiedAt(&self, path: &str, time: i64) -> HostResult<()> { self.modified.lock().unwrap().insert(path.into(), time); Ok(()) }
     fn writeBytes(&self, path: &str, bytes: &[u8]) -> HostResult<()> {
         let mut failure = self.fail_write.lock().unwrap();
         if failure.as_deref() == Some(path) {
@@ -50,6 +57,7 @@ impl RuntimeStorageHost for MemoryStorage {
             return Err(HostError::new("injected write failure"));
         }
         self.files.lock().unwrap().insert(path.into(), bytes.into());
+        *self.modified.lock().unwrap().entry(path.into()).or_default() += 1;
         Ok(())
     }
     fn appendBytes(&self, path: &str, bytes: &[u8]) -> HostResult<()> {
@@ -59,6 +67,7 @@ impl RuntimeStorageHost for MemoryStorage {
             .entry(path.into())
             .or_default()
             .extend_from_slice(bytes);
+        *self.modified.lock().unwrap().entry(path.into()).or_default() += 1;
         Ok(())
     }
     fn delete(&self, path: &str, recursive: bool) -> HostResult<()> {
@@ -922,9 +931,9 @@ fn shared_builtin_customization_syncs_source_changes_without_deleting_configurat
     assert_eq!(target.readBytes(&config).unwrap(), b"shared configuration");
 }
 
-/// Legacy device-scope builtin records merge into the required space installation.
+/// Shared ownership replaces the bundled local record without merging independent local settings.
 #[test]
-fn builtin_scope_duplicate_records_merge_into_required_space_installation() {
+fn shared_builtin_owner_replaces_local_state() {
     let storage = host();
     let store = ExtensionStore::new(storage.clone());
     let settings = |enabled: Value, order: u64| {
@@ -952,21 +961,19 @@ fn builtin_scope_duplicate_records_merge_into_required_space_installation() {
         .contains("ownership conflict"));
 
     assert!(store
-        .reconcileBuiltinScopeDuplicates("package", "bundle", "space")
+        .acceptsBuiltinPackage("bundle")
         .unwrap());
     let merged = store.record("package", "bundle").unwrap();
     assert_eq!(merged.scope, "space");
-    assert_eq!(merged.settings["enabledNames"], json!(["canonical", "legacy"]));
-    assert_eq!(merged.settings["order"], json!(7));
+    assert_eq!(merged.settings["enabledNames"], json!(["canonical"]));
+    assert_eq!(merged.settings["order"], json!(2));
     assert_eq!(merged.settings["installationScope"], json!("space"));
     assert!(store
         .records("package")
         .unwrap()
         .iter()
         .all(|record| record.scope == "space"));
-    assert!(!store
-        .reconcileBuiltinScopeDuplicates("package", "bundle", "space")
-        .unwrap());
+    assert!(store.acceptsBuiltinPackage("bundle").unwrap());
 }
 
 /// Genuine ownership conflicts must keep failing instead of being auto-merged.
@@ -980,9 +987,7 @@ fn builtin_scope_reconciliation_refuses_non_builtin_duplicates() {
     duplicate.settings["installationScope"] = json!("space");
     store.write(&duplicate).unwrap();
 
-    assert!(!store
-        .reconcileBuiltinScopeDuplicates("package", "bundle", "space")
-        .unwrap());
+    assert!(store.acceptsBuiltinPackage("bundle").unwrap_err().contains("ownership conflict"));
     assert!(store
         .record("package", "bundle")
         .unwrap_err()
@@ -1037,30 +1042,123 @@ fn late_builtin_initialization_preserves_explicit_shared_installation() {
     assert_eq!(peer.record("package", "demo").unwrap(), expected);
 }
 
-/// A synchronized uninstall prevents automatic registration on every later startup.
+/// Moves bundled ownership through the existing sync path and preserves the selected subpackage flags.
 #[test]
-fn builtin_initialization_cannot_resurrect_a_deleted_shared_installation() {
+fn builtin_scope_moves_sync_flags_and_allows_deleting_bundled_installations() {
     let source = host();
     let target = host();
     let store = ExtensionStore::new(source.clone());
+    let peer = ExtensionStore::new(target.clone());
     let settings = json!({
-        "members": ["demo"], "enabledNames": [], "disabledNames": [],
-        "subpackageStates": {}, "order": 0, "builtin": true,
+        "members": ["demo", "demo_tools"], "enabledNames": ["demo"], "disabledNames": [],
+        "subpackageStates": {"demo_tools": false}, "order": 7, "builtin": true,
         "installationId": "00000000000000000000000000000000"
     });
-    store.registerInScope("package", "demo", "", settings.clone(), "space").unwrap();
-    let bootstrap = operations(&source, &SyncClock::empty());
-    transfer(&source, &target, &bootstrap).unwrap();
-    let before_delete = clock(&source);
-    store.delete("package", "demo").unwrap();
-    transfer(&source, &target, &operations(&source, &before_delete)).unwrap();
-    let peer = ExtensionStore::new(target.clone());
-    let before_boot = clock(&target);
-    assert!(!peer.acceptsSharedBuiltinPackage("demo").unwrap());
-    peer.registerInScope("package", "demo", "", settings, "space").unwrap();
-    transfer(&source, &target, &bootstrap).unwrap();
+    store.registerDevice("package", "demo", "", settings.clone()).unwrap();
+    let mut local_settings = settings.clone();
+    local_settings["subpackageStates"]["demo_tools"] = json!(true);
+    peer.registerDevice("package", "demo", "", local_settings).unwrap();
+    let local_config = format!("{}/settings.json", ExtensionStore::configPathForScope("demo", "device").unwrap());
+    let shared_config = format!("{}/settings.json", ExtensionStore::configPathForScope("demo", "space").unwrap());
+    let private_data = format!("{}/notes.txt", ExtensionStore::localDataPath("demo").unwrap());
+    source.writeBytes(&local_config, b"shared configuration").unwrap();
+    target.writeBytes(&local_config, b"old local configuration").unwrap();
+    target.writeBytes(&private_data, b"private device data").unwrap();
+    store.moveScope("package", "demo", "space").unwrap();
+    transfer(&source, &target, &operations(&source, &SyncClock::empty())).unwrap();
+    let before_adoption = clock(&target);
+    assert!(peer.acceptsBuiltinPackage("demo").unwrap());
+    assert_eq!(peer.record("package", "demo").unwrap(), store.record("package", "demo").unwrap());
+    assert_eq!(clock(&target), before_adoption);
+    assert!(!target.exists(&recordPath("package", "demo", "device").unwrap()).unwrap());
+    assert!(!target.exists(&local_config).unwrap());
+    assert_eq!(target.readBytes(&shared_config).unwrap(), b"shared configuration");
+    assert_eq!(target.readBytes(&private_data).unwrap(), b"private device data");
+    let before_toggle = clock(&source);
+    let mut updated = store.record("package", "demo").unwrap().settings;
+    updated["subpackageStates"]["demo_tools"] = json!(true);
+    store.setSettings("package", "demo", updated).unwrap();
+    transfer(&source, &target, &operations(&source, &before_toggle)).unwrap();
+    assert_eq!(peer.record("package", "demo").unwrap().settings["subpackageStates"]["demo_tools"], true);
+    let before_move = clock(&target);
+    peer.moveScope("package", "demo", "device").unwrap();
+    transfer(&target, &source, &operations(&target, &before_move)).unwrap();
+    assert!(!store.acceptsBuiltinPackage("demo").unwrap());
+    assert!(store.record("package", "demo").is_err());
+    assert!(peer.acceptsBuiltinPackage("demo").unwrap());
+    assert_eq!(target.readBytes(&local_config).unwrap(), b"shared configuration");
+    assert_eq!(target.readBytes(&private_data).unwrap(), b"private device data");
+    let local = peer.record("package", "demo").unwrap();
+    assert_eq!(local.scope, "device");
+    assert_eq!(local.settings["subpackageStates"]["demo_tools"], true);
+    assert_eq!(local.settings["order"], 7);
+    peer.delete("package", "demo").unwrap();
     assert!(peer.record("package", "demo").is_err());
-    assert_eq!(clock(&target), before_boot);
+    assert!(!peer.acceptsBuiltinPackage("demo").unwrap());
+    assert!(!target.exists(&local_config).unwrap());
+    assert_eq!(target.readBytes(&private_data).unwrap(), b"private device data");
+}
+
+/// Preserves plugin data during bundled uninstallation and synchronizes only installation removal.
+#[test]
+fn builtin_deletion_retires_installations_and_syncs_shared_removal() {
+    for scope in ["device", "space"] {
+        for failed in [false, true] {
+            let source = host();
+            let target = host();
+            let store = ExtensionStore::new(source.clone());
+            let peer = ExtensionStore::new(target.clone());
+            let settings = json!({
+                "members": ["demo"], "enabledNames": ["demo"], "disabledNames": [],
+                "subpackageStates": {}, "order": 0, "builtin": true,
+                "installationId": "00000000000000000000000000000000"
+            });
+            store.registerInScope("package", "demo", "", settings.clone(), scope).unwrap();
+            let mut data_files = Vec::new();
+            for data_scope in ["device", "space"] {
+                let root = ExtensionStore::dataPathForScope("demo", data_scope).unwrap();
+                for name in ["cards.preferences.json", "groups.preferences.json", "memory.sqlite", "owner/USER.md"] {
+                    let path = format!("{root}/{name}");
+                    let bytes = format!("existing {data_scope} {name}").into_bytes();
+                    source.writeBytes(&path, &bytes).unwrap();
+                    data_files.push((path, bytes));
+                }
+            }
+            if scope == "space" {
+                transfer(&source, &target, &operations(&source, &SyncClock::empty())).unwrap();
+                assert!(peer.acceptsBuiltinPackage("demo").unwrap());
+            }
+            let before_delete = clock(&source);
+            if failed {
+                assert!(store.deleteFailedPackageInstallations("demo").unwrap());
+                assert!(!store.deleteFailedPackageInstallations("demo").unwrap());
+            } else {
+                store.delete("package", "demo").unwrap();
+            }
+            assert!(store.record("package", "demo").is_err());
+            assert!(!ExtensionStore::new(source.clone()).acceptsBuiltinPackage("demo").unwrap());
+            for (path, bytes) in &data_files {
+                assert_eq!(source.readBytes(path).unwrap(), *bytes, "Uninstallation changed plugin data: {path}");
+            }
+            assert!(operations(&source, &before_delete).iter()
+                .all(|operation| !operation.entityId.starts_with("runtime/plugin_data/")));
+            if scope == "space" {
+                transfer(&source, &target, &operations(&source, &before_delete)).unwrap();
+                assert!(peer.record("package", "demo").is_err());
+                assert!(!peer.acceptsBuiltinPackage("demo").unwrap());
+            } else {
+                assert!(operations(&source, &before_delete).is_empty());
+                assert!(peer.acceptsBuiltinPackage("demo").unwrap());
+                store.registerDevice("package", "demo", "", settings).unwrap();
+                for (path, bytes) in &data_files {
+                    assert_eq!(source.readBytes(path).unwrap(), *bytes, "Reinstallation changed plugin data: {path}");
+                }
+                assert!(store.acceptsBuiltinPackage("demo").unwrap());
+                store.delete("package", "demo").unwrap();
+                assert!(!store.acceptsBuiltinPackage("demo").unwrap());
+            }
+        }
+    }
 }
 
 /// Retires the duplicate settings copy without letting it replace descriptor ownership.
@@ -1092,4 +1190,263 @@ fn legacy_settings_migrate_once_without_changing_the_installation_source() {
     assert_eq!(store.record("package", "demo").unwrap(), record);
     let changes = operations(&storage, &migrated);
     assert!(changes.iter().all(|op| op.domain == "preferences"));
+}
+
+
+/// Replicates package environment values only after their installation belongs to Space.
+#[test]
+fn package_environment_follows_installation_scope_and_subpackage_ownership() {
+    let source = host();
+    let target = host();
+    let store = ExtensionStore::new(source.clone());
+    source
+        .writeBytes(
+            "runtime/extensions/device/packages/shared.toolpkg",
+            b"package",
+        )
+        .unwrap();
+    register_package_owner(&store, "shared", &["shared", "shared.tools"]);
+    register_package_owner(&store, "local", &["local"]);
+    store
+        .editPackageEnvironment(
+            "shared.tools",
+            BTreeMap::from([("TOKEN".into(), Some("shared-token".into()))]),
+        )
+        .unwrap();
+    store
+        .editPackageEnvironment(
+            "local",
+            BTreeMap::from([("TOKEN".into(), Some("local-token".into()))]),
+        )
+        .unwrap();
+    assert!(operations(&source, &SyncClock::empty()).is_empty());
+    assert_eq!(
+        store.packageEnvironment("shared.tools").unwrap().ownerId,
+        "shared"
+    );
+    assert_eq!(
+        store.packageEnvironment("shared").unwrap().variables["TOKEN"],
+        "shared-token"
+    );
+    assert_eq!(
+        store.packageEnvironment("local").unwrap().variables["TOKEN"],
+        "local-token"
+    );
+
+    store.moveScope("package", "shared", "space").unwrap();
+    transfer(&source, &target, &operations(&source, &SyncClock::empty())).unwrap();
+    let remote = ExtensionStore::new(target.clone());
+    assert_eq!(
+        remote.packageEnvironment("shared.tools").unwrap(),
+        store.packageEnvironment("shared").unwrap()
+    );
+    assert!(remote.packageEnvironment("local").is_err());
+    assert!(!source
+        .exists(&format!(
+            "{}/environment.json",
+            ExtensionStore::configPathForScope("shared", "device").unwrap()
+        ))
+        .unwrap());
+
+    let before = clock(&source);
+    store
+        .editPackageEnvironment(
+            "shared",
+            BTreeMap::from([
+                ("TOKEN".into(), None),
+                ("URL".into(), Some("https://example.test".into())),
+            ]),
+        )
+        .unwrap();
+    store
+        .editPackageEnvironment(
+            "local",
+            BTreeMap::from([("TOKEN".into(), Some("new-local-token".into()))]),
+        )
+        .unwrap();
+    let changes = operations(&source, &before);
+    assert_eq!(changes.len(), 1);
+    assert!(changes[0].entityId.ends_with("/shared/environment.json"));
+    transfer(&source, &target, &changes).unwrap();
+    assert_eq!(
+        remote.packageEnvironment("shared").unwrap().variables,
+        BTreeMap::from([("URL".into(), "https://example.test".into())])
+    );
+
+    let before = clock(&source);
+    store.moveScope("package", "shared", "device").unwrap();
+    transfer(&source, &target, &operations(&source, &before)).unwrap();
+    assert!(remote.packageEnvironment("shared").is_err());
+    let before = clock(&source);
+    store
+        .editPackageEnvironment(
+            "shared.tools",
+            BTreeMap::from([("TOKEN".into(), Some("device-token".into()))]),
+        )
+        .unwrap();
+    assert!(operations(&source, &before).is_empty());
+    assert_eq!(
+        store.packageEnvironment("shared").unwrap().variables["TOKEN"],
+        "device-token"
+    );
+}
+
+/// Package edits preserve unrelated keys and an unchanged edit produces no synchronization write.
+#[test]
+fn package_environment_edits_preserve_other_values_and_skip_unchanged_snapshots() {
+    let storage = host();
+    let store = ExtensionStore::new(storage.clone());
+    storage
+        .writeBytes(
+            "runtime/extensions/device/packages/demo.toolpkg",
+            b"package",
+        )
+        .unwrap();
+    register_package_owner(&store, "demo", &["demo"]);
+    store.moveScope("package", "demo", "space").unwrap();
+    store
+        .editPackageEnvironment(
+            "demo",
+            BTreeMap::from([
+                ("TOKEN".into(), Some("token".into())),
+                ("OTHER".into(), Some("keep".into())),
+            ]),
+        )
+        .unwrap();
+    let before = clock(&storage);
+    store
+        .editPackageEnvironment(
+            "demo",
+            BTreeMap::from([("TOKEN".into(), Some("token".into()))]),
+        )
+        .unwrap();
+    assert!(operations(&storage, &before).is_empty());
+    store
+        .editPackageEnvironment("demo", BTreeMap::from([("TOKEN".into(), None)]))
+        .unwrap();
+    assert_eq!(
+        store.packageEnvironment("demo").unwrap().variables,
+        BTreeMap::from([("OTHER".into(), "keep".into())])
+    );
+}
+
+/// Invalid ownership and malformed configuration fail without overwriting existing bytes.
+#[test]
+fn package_environment_rejects_missing_owners_and_corrupt_configuration() {
+    let storage = host();
+    let store = ExtensionStore::new(storage.clone());
+    assert!(store
+        .editPackageEnvironment("missing", BTreeMap::new())
+        .is_err());
+    storage
+        .writeBytes(
+            "runtime/extensions/device/packages/demo.toolpkg",
+            b"package",
+        )
+        .unwrap();
+    register_package_owner(&store, "demo", &["demo"]);
+    let path = format!("{}/environment.json", store.configPath("demo").unwrap());
+    storage.writeBytes(&path, b"[]").unwrap();
+    assert!(store.packageEnvironment("demo").is_err());
+    assert!(store
+        .editPackageEnvironment("demo", BTreeMap::from([("TOKEN".into(), Some("x".into()))]))
+        .is_err());
+    assert_eq!(storage.readBytes(&path).unwrap(), b"[]");
+    assert!(operations(&storage, &SyncClock::empty()).is_empty());
+}
+
+/// Registration can use its explicit installation scope before a package record exists.
+#[test]
+fn package_environment_registration_uses_the_declared_scope_before_installation() {
+    let storage = host();
+    let store = ExtensionStore::new(storage.clone());
+    store
+        .editPackageEnvironmentForScope(
+            "demo",
+            "space",
+            BTreeMap::from([("TOKEN".into(), Some("registration-value".into()))]),
+        )
+        .unwrap();
+    assert_eq!(
+        store.packageEnvironmentForScope("demo", "space").unwrap()["TOKEN"],
+        "registration-value"
+    );
+    assert!(store
+        .packageEnvironmentForScope("demo", "device")
+        .unwrap()
+        .is_empty());
+    assert!(store.packageEnvironment("demo").is_err());
+    assert_eq!(operations(&storage, &SyncClock::empty()).len(), 1);
+}
+
+/// Imports only declared legacy values once and never consults the legacy file during reads.
+#[test]
+fn package_environment_migration_is_once_only_and_respects_explicit_space_edits() {
+    let source = host();
+    let target = host();
+    let local = ExtensionStore::new(source.clone());
+    let remote = ExtensionStore::new(target.clone());
+    source
+        .writeBytes(
+            "runtime/extensions/device/packages/demo.toolpkg",
+            b"package",
+        )
+        .unwrap();
+    register_package_owner(&local, "demo", &["demo"]);
+    local.moveScope("package", "demo", "space").unwrap();
+    transfer(&source, &target, &operations(&source, &SyncClock::empty())).unwrap();
+    for (storage, token) in [(&source, "legacy-source"), (&target, "legacy-target")] {
+        let legacy = CoreNodeStateStore::newWithStorage(
+            storage.clone(),
+            operit_util::RuntimeStorageLayout::LEGACY_ENV_PREFERENCES_PATH,
+        );
+        legacy
+            .edit(|preferences| {
+                preferences.set(&stringPreferencesKey("TOKEN"), token.to_string());
+                preferences.set(
+                    &stringPreferencesKey("UNRELATED"),
+                    "must-stay-local".to_string(),
+                );
+            })
+            .unwrap();
+    }
+    let declared = vec!["TOKEN".to_string()];
+    local
+        .initializePackageEnvironment("demo", &declared)
+        .unwrap();
+    assert_eq!(
+        local.packageEnvironment("demo").unwrap().variables,
+        BTreeMap::from([("TOKEN".into(), "legacy-source".into())])
+    );
+    local
+        .editPackageEnvironment(
+            "demo",
+            BTreeMap::from([("TOKEN".into(), Some("explicit".into()))]),
+        )
+        .unwrap();
+    remote
+        .initializePackageEnvironment("demo", &declared)
+        .unwrap();
+    let remoteOperations = operations(&target, &SyncClock::empty());
+    transfer(&source, &target, &operations(&source, &SyncClock::empty())).unwrap();
+    transfer(&target, &source, &remoteOperations).unwrap();
+    assert_eq!(
+        local.packageEnvironment("demo").unwrap().variables["TOKEN"],
+        "explicit"
+    );
+    assert_eq!(
+        remote.packageEnvironment("demo").unwrap().variables["TOKEN"],
+        "explicit"
+    );
+    local
+        .editPackageEnvironment("demo", BTreeMap::from([("TOKEN".into(), None)]))
+        .unwrap();
+    local
+        .initializePackageEnvironment("demo", &declared)
+        .unwrap();
+    assert!(local
+        .packageEnvironment("demo")
+        .unwrap()
+        .variables
+        .is_empty());
 }

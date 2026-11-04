@@ -49,7 +49,7 @@ class ThemeClassicComposerTextEditor extends StatelessWidget {
     required this.hasDraftText,
     required this.transparentSurface,
     required this.settings,
-    required this.onSubmitted,
+    this.onSubmitted,
     required this.onToggleExpansion,
     required this.expandTooltip,
     required this.collapseTooltip,
@@ -63,7 +63,9 @@ class ThemeClassicComposerTextEditor extends StatelessWidget {
   final bool hasDraftText;
   final bool transparentSurface;
   final Widget settings;
-  final ValueChanged<String> onSubmitted;
+  // IME submission can mean candidate confirmation; chat composers send
+  // through hardware shortcuts or the send button instead of this callback.
+  final ValueChanged<String>? onSubmitted;
   final VoidCallback onToggleExpansion;
   final String expandTooltip;
   final String collapseTooltip;
@@ -146,11 +148,13 @@ class ThemeClassicComposerBody extends StatelessWidget {
     required this.editor,
     required this.attachment,
     required this.action,
+    this.actionWidth = 36,
   });
   final bool inputExpanded;
   final Widget editor;
   final Widget attachment;
   final Widget action;
+  final double actionWidth;
   @override
   Widget build(BuildContext context) => AnimatedSize(
     duration: const Duration(milliseconds: 340),
@@ -162,7 +166,7 @@ class ThemeClassicComposerBody extends StatelessWidget {
       children: <Widget>[
         Expanded(child: editor),
         ThemeComposerHorizontalVisibility(
-          width: 86,
+          width: 50 + actionWidth,
           height: 36,
           visible: !inputExpanded,
           alignment: AlignmentDirectional.centerEnd,
@@ -424,7 +428,7 @@ class ThemeComposerTextEditor extends StatelessWidget {
     required this.hintText,
     required this.inputExpanded,
     required this.readOnly,
-    required this.onSubmitted,
+    this.onSubmitted,
     required this.onToggleExpansion,
     required this.expandTooltip,
     required this.collapseTooltip,
@@ -436,7 +440,9 @@ class ThemeComposerTextEditor extends StatelessWidget {
   final String hintText;
   final bool inputExpanded;
   final bool readOnly;
-  final ValueChanged<String> onSubmitted;
+  // IME submission can mean candidate confirmation; chat composers send
+  // through hardware shortcuts or the send button instead of this callback.
+  final ValueChanged<String>? onSubmitted;
   final VoidCallback onToggleExpansion;
   final String expandTooltip;
   final String collapseTooltip;

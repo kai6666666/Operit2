@@ -85,14 +85,14 @@ impl Workspace {
 
     /// Derives a single-segment folder name from a VFS path.
     pub fn folderNameFromPath(path: &str) -> Result<String, String> {
-        let trimmed = path.trim().trim_end_matches('/');
-        let name = trimmed.rsplit('/').next().map(str::trim).unwrap_or("");
-        if name.is_empty() || name == "." || name == ".." {
-            return Err(format!("cannot derive folder name from path: {path}"));
-        }
-        if name.contains('\\') {
-            return Err(format!("cannot derive folder name from path: {path}"));
-        }
+        let name = path
+            .trim()
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .map(str::trim)
+            .filter(|name| !matches!(*name, "" | "." | ".." | "file:") && !name.contains('\\'))
+            .ok_or_else(|| format!("cannot derive folder name from path: {path}"))?;
         Ok(name.to_string())
     }
 
@@ -142,6 +142,17 @@ impl Workspace {
 mod tests {
     use super::*;
 
+    #[test]
+    fn workspace_folder_preserves_vfs_addresses() {
+        let folder: WorkspaceFolder = serde_json::from_value(serde_json::json!({
+            "name": "project", "path": "/app/workspaces/demo"
+        })).unwrap();
+        assert_eq!(folder.path, "/app/workspaces/demo");
+        let folder = WorkspaceFolder { name: "external".into(), path: "/mnt/local/folders/id".into() };
+        assert_eq!(serde_json::to_value(folder).unwrap()["path"], "/mnt/local/folders/id");
+    }
+
+
     fn singleFolderWorkspace(name: &str, path: &str) -> Workspace {
         Workspace::fromSingleFolder(
             name.to_string(),
@@ -153,10 +164,10 @@ mod tests {
 
     #[test]
     fn mountFolderAppendsNewFolders() {
-        let mut workspace = singleFolderWorkspace("harmoon", "/mnt/linux/home/harmoon");
+        let mut workspace = singleFolderWorkspace("harmoon", "/virtual/linux/home/harmoon");
         let changed = workspace.mountFolder(WorkspaceFolder {
             name: "debug".to_string(),
-            path: "/mnt/linux/home/harmoon/projects".to_string(),
+            path: "/virtual/linux/home/harmoon/projects".to_string(),
         });
         assert!(changed);
         assert_eq!(workspace.folders.len(), 2);
@@ -165,10 +176,10 @@ mod tests {
 
     #[test]
     fn mountFolderIgnoresAlreadyMountedPaths() {
-        let mut workspace = singleFolderWorkspace("harmoon", "/mnt/linux/home/harmoon");
+        let mut workspace = singleFolderWorkspace("harmoon", "/virtual/linux/home/harmoon");
         let changed = workspace.mountFolder(WorkspaceFolder {
             name: "home".to_string(),
-            path: "/mnt/linux/home/harmoon".to_string(),
+            path: "/virtual/linux/home/harmoon".to_string(),
         });
         assert!(!changed);
         assert_eq!(workspace.folders.len(), 1);
@@ -177,7 +188,7 @@ mod tests {
 
     #[test]
     fn mountFolderRebindsKnownNameToMovedPath() {
-        let mut workspace = singleFolderWorkspace("harmoon", "/mnt/linux/home/harmoon");
+        let mut workspace = singleFolderWorkspace("harmoon", "/virtual/linux/home/harmoon");
         let changed = workspace.mountFolder(WorkspaceFolder {
             name: "harmoon".to_string(),
             path: "/home/harmoon".to_string(),
@@ -186,5 +197,27 @@ mod tests {
         assert_eq!(workspace.folders.len(), 1);
         assert_eq!(workspace.folders[0].path, "/home/harmoon");
         workspace.validate().expect("rebind must stay valid");
+    }
+
+    /// Rejects paths without a real folder name instead of inventing a root folder.
+    #[test]
+    fn folderNamesRejectInvalidPaths() {
+        for path in [
+            "", " \t ", "/", "///", ".", "..", "/tmp/.", "/tmp/..", "file:", "file:///",
+        ] {
+            assert!(Workspace::folderNameFromPath(path).is_err(), "{path:?}");
+        }
+    }
+
+    /// Derives folder names from real VFS folders while accepting surrounding whitespace and trailing separators.
+    #[test]
+    fn folderNamesPreserveRealFolders() {
+        for (path, expected) in [
+            ("/virtual/linux/home/harmoon", "harmoon"),
+            (" /operitapp/workspaces/demo/ ", "demo"),
+            ("/virtual/android/sdcard/Projects", "Projects"),
+        ] {
+            assert_eq!(Workspace::folderNameFromPath(path).unwrap(), expected);
+        }
     }
 }

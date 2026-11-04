@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:webview_all/webview_all.dart';
 
+import '../interactions/ChainedScrollController.dart';
 import '../interactions/MessagePressShield.dart';
 import 'CanvasMonospaceCodeBlockBody.dart';
 import 'MarkdownCodeTypeface.dart';
@@ -114,7 +115,7 @@ class _EnhancedCodeBlockState extends State<EnhancedCodeBlock> {
             : '${widget.language} Code block',
         child: Container(
           width: double.infinity,
-          margin: const EdgeInsets.symmetric(vertical: 4),
+          margin: const EdgeInsets.symmetric(vertical: 2),
           decoration: BoxDecoration(
             color: codeBlockBackground,
             borderRadius: BorderRadius.circular(4),
@@ -320,8 +321,7 @@ class _EnhancedCodeBlockState extends State<EnhancedCodeBlock> {
               else
                 ConstrainedBox(
                   constraints: const BoxConstraints(maxHeight: 420),
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.vertical,
+                  child: ChainedSingleChildScrollView(
                     child: autoWrapEnabled
                         ? codeBody
                         : SingleChildScrollView(

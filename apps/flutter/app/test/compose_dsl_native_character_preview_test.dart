@@ -22,7 +22,7 @@ Map<String, dynamic> _fixture(String name) {
     if (node['type'] == 'Image') {
       final props = node['props'] as Map<String, dynamic>;
       if (props['path'] != null)
-        props['path'] = '/app/preview/operit-avatar.png';
+        props['path'] = '/operitapp/preview/operit-avatar.png';
     }
     for (final child in node['children'] as List) {
       visit(child as Map<String, dynamic>);
@@ -164,9 +164,10 @@ void main() {
           160,
           scrollable: _readingScrollable(),
         );
+        final previousActions = actions.length;
         await tester.tap(find.text('配置摘要'));
         await tester.pump();
-        expect(actions, hasLength(1));
+        expect(actions, hasLength(previousActions + 1));
         expect(tester.takeException(), isNull);
         tester.view.physicalSize = const Size(600, 850);
         await tester.pumpAndSettle();

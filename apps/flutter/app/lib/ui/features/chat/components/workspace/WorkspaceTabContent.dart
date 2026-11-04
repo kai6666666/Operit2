@@ -16,8 +16,12 @@ import 'WorkspaceFilePreviewContent.dart';
 import 'WorkspaceHomeContent.dart';
 import 'WorkspaceOverviewModels.dart';
 import 'WorkspaceTabModels.dart';
+import 'browser/WorkspaceBrowserViewStore.dart';
 import 'terminal/WorkspaceTerminalContent.dart';
+import 'terminal/WorkspaceTerminalSessions.dart';
+import '../WorkspaceShell.dart';
 import '../../../../main/screens/OperitScreens.dart';
+import '../../../../common/contributions/PluginWorkspacePageHost.dart';
 
 class WorkspaceTabContent extends StatelessWidget {
   const WorkspaceTabContent({
@@ -27,6 +31,7 @@ class WorkspaceTabContent extends StatelessWidget {
     required this.workspaceUsage,
     required this.terminalSessionCountListenable,
     required this.browserSessionCountListenable,
+    this.terminalSessionsListenable,
     required this.onListWorkspaceFiles,
     required this.onListWorkspaceBindingDirectories,
     required this.onReadWorkspaceTextFile,
@@ -41,14 +46,18 @@ class WorkspaceTabContent extends StatelessWidget {
     required this.onOpenTerminalSessions,
     required this.onOpenBrowserSessions,
     required this.onOpenBrowser,
+    this.onSelectTerminalSession,
+    this.onCloseTerminalSession,
+    this.onSelectBrowserTab,
+    this.onCloseBrowserSession,
     required this.onFinishWebVisit,
-    required this.onActivateCurrentTab,
     required this.onCloseCurrentTab,
     required this.onOpenWorkspaceCreator,
     required this.onBindWorkspace,
     required this.onChooseExistingWorkspace,
     required this.onUnbindWorkspace,
     required this.splitMarkdownContent,
+    this.pluginHomeContent = const SizedBox.shrink(),
   });
 
   final WorkspaceTab tab;
@@ -56,6 +65,8 @@ class WorkspaceTabContent extends StatelessWidget {
   final WorkspaceOverviewUsage workspaceUsage;
   final ValueListenable<int> terminalSessionCountListenable;
   final ValueListenable<int> browserSessionCountListenable;
+  final ValueListenable<List<WorkspaceTerminalSessionInfo>>?
+  terminalSessionsListenable;
   final Future<List<WorkspaceFileEntry>> Function(String path)
   onListWorkspaceFiles;
   final Future<List<WorkspaceFileEntry>> Function(String path)
@@ -78,15 +89,19 @@ class WorkspaceTabContent extends StatelessWidget {
     String? workspaceHtmlPath,
   })
   onOpenBrowser;
+  final ValueChanged<WorkspaceTerminalSessionInfo>? onSelectTerminalSession;
+  final ValueChanged<WorkspaceTerminalSessionInfo>? onCloseTerminalSession;
+  final ValueChanged<WorkspaceBrowserTabState>? onSelectBrowserTab;
+  final ValueChanged<String>? onCloseBrowserSession;
   final void Function(WorkspaceTab tab, WebVisitResponse response)
   onFinishWebVisit;
-  final VoidCallback onActivateCurrentTab;
   final VoidCallback onCloseCurrentTab;
   final VoidCallback onOpenWorkspaceCreator;
   final Future<void> Function(String workspace) onBindWorkspace;
   final VoidCallback onChooseExistingWorkspace;
   final VoidCallback onUnbindWorkspace;
   final MarkdownContentSplitter splitMarkdownContent;
+  final Widget pluginHomeContent;
 
   /// Builds the selected tab with shared workspace capability callbacks.
   @override
@@ -99,6 +114,7 @@ class WorkspaceTabContent extends StatelessWidget {
           workspaceUsage: workspaceUsage,
           terminalSessionCountListenable: terminalSessionCountListenable,
           browserSessionCountListenable: browserSessionCountListenable,
+          terminalSessionsListenable: terminalSessionsListenable,
           onOpenFolder: onOpenFolder,
           onAddFolder: onAddFolder,
           onCreateWorkspace: onOpenWorkspaceCreator,
@@ -108,6 +124,11 @@ class WorkspaceTabContent extends StatelessWidget {
           onOpenTerminalSessions: onOpenTerminalSessions,
           onOpenBrowserSessions: onOpenBrowserSessions,
           onOpenBrowser: () => onOpenBrowser(),
+          onSelectTerminalSession: onSelectTerminalSession,
+          onCloseTerminalSession: onCloseTerminalSession,
+          onSelectBrowserTab: onSelectBrowserTab,
+          onCloseBrowserSession: onCloseBrowserSession,
+          pluginContent: pluginHomeContent,
         );
       case WorkspaceTabKind.workspacePicker:
         return WorkspaceFileBrowserContent(
@@ -157,6 +178,7 @@ class WorkspaceTabContent extends StatelessWidget {
         );
       case WorkspaceTabKind.browser:
         return WorkspaceBrowserContent(
+          sessionId: tab.browserSessionId,
           workspacePath: workspacePath,
           initialUrl: tab.url,
           initialUserAgent: tab.userAgent,
@@ -168,7 +190,6 @@ class WorkspaceTabContent extends StatelessWidget {
           onWriteWorkspaceFileBytes: onWriteWorkspaceFileBytes,
           onOpenWorkspaceFile: onOpenWorkspaceFile,
           onOpenBrowserTab: onOpenBrowser,
-          onActivateRequested: onActivateCurrentTab,
           onCloseRequested: onCloseCurrentTab,
         );
       case WorkspaceTabKind.webVisit:
@@ -194,6 +215,14 @@ class WorkspaceTabContent extends StatelessWidget {
           splitMarkdownContent: splitMarkdownContent,
         );
       case WorkspaceTabKind.plugin:
+        if (tab.pluginPresentation case final presentation?) {
+          return PluginWorkspacePageHost(
+            key: ValueKey(presentation.identity),
+            presentation: presentation,
+            workspacePath: workspacePath,
+            hostState: WorkspaceShell.session.pluginHostState,
+          );
+        }
         final packageName = tab.pluginPackageName;
         final moduleId = tab.pluginUiModuleId;
         if (packageName == null || moduleId == null) {
