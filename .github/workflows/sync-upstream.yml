@@ -79,6 +79,9 @@ jobs:
 
       - name: Keep scheduled workflow alive
         if: ${{ steps.merge.outputs.changed != 'true' }}
+        continue-on-error: true
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
         run: |
           STAMP=".ci/last-alive"
           if [ -f "$STAMP" ]; then
@@ -93,7 +96,14 @@ jobs:
             date -u +%Y-%m-%dT%H:%M:%SZ > "$STAMP"
             git add "$STAMP"
             git commit -m "chore(ci): keepalive $(date -u +%F)"
-            git push origin HEAD:main
+            PUSH_URL="origin"
+            if [ -n "$SYNC_PAT" ]; then
+              PUSH_URL="https://x-access-token:${SYNC_PAT}@github.com/kai6666666/Operit2.git"
+            fi
+            for attempt in 1 2 3; do
+              if git push "$PUSH_URL" HEAD:main; then break; fi
+              sleep $((attempt * 10))
+            done
           else
             echo "keepalive not needed"
           fi
