@@ -48,6 +48,11 @@ jobs:
           fi
           if git merge --no-edit upstream/main; then
             AFTER=$(git rev-parse HEAD)
+            if [ "$AFTER" = "$BEFORE" ]; then
+              echo "merge produced no new commit"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "after=$AFTER"
             PUSH_URL="origin"
@@ -95,15 +100,16 @@ jobs:
 
       - name: Trigger APK build
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          GH_REPO: kai6666666/Operit2
         run: |
           CHANGED="${{ steps.merge.outputs.changed }}"
           FORCE="${{ inputs.force_build }}"
           if [ "$CHANGED" = "true" ] || [ "$FORCE" = "true" ]; then
             echo "dispatching build-apk.yml (changed=$CHANGED force=$FORCE)"
-            gh workflow run build-apk.yml --ref main
+            gh workflow run build-apk.yml --ref main --repo kai6666666/Operit2
             sleep 8
-            gh run list --workflow build-apk.yml --limit 2
+            gh run list --workflow build-apk.yml --limit 2 --repo kai6666666/Operit2
           else
             echo "upstream 无更新且未强制，跳过构建"
           fi
