@@ -1,0 +1,92 @@
+name: Sync upstream and rebuild
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "即使上游无更新也触发一次 APK 构建（true/false）"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git config user.name "operit2-sync-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git remote add upstream https://github.com/AAswordman/Operit2.git 2>/dev/null || true
+          git fetch upstream main --no-tags
+          BEFORE=$(git rev-parse HEAD)
+          echo "before=$BEFORE upstream=$(git rev-parse upstream/main)"
+          if [ "$BEFORE" = "$(git rev-parse upstream/main)" ]; then
+            echo "already up to date"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git merge --no-edit --no-rebase upstream/main; then
+            AFTER=$(git rev-parse HEAD)
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "after=$AFTER"
+            git push origin HEAD:main
+          else
+            echo "::error::upstream merge conflict; resolve manually in the fork"
+            git merge --abort || true
+            exit 1
+          fi
+
+      - name: Keep scheduled workflow alive
+        if: ${{ steps.merge.outputs.changed != 'true' }}
+        run: |
+          STAMP=".ci/last-alive"
+          if [ -f "$STAMP" ]; then
+            LAST=$(date -d "$(cat "$STAMP")" +%s)
+            DAYS=$(( ($(date +%s) - LAST) / 86400 ))
+          else
+            DAYS=999
+          fi
+          echo "days since last keepalive: $DAYS"
+          if [ "$DAYS" -ge 30 ]; then
+            mkdir -p .ci
+            date -u +%Y-%m-%dT%H:%M:%SZ > "$STAMP"
+            git add "$STAMP"
+            git commit -m "chore(ci): keepalive $(date -u +%F)"
+            git push origin HEAD:main
+          else
+            echo "keepalive not needed"
+          fi
+
+      - name: Trigger APK build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CHANGED="${{ steps.merge.outputs.changed }}"
+          FORCE="${{ inputs.force_build }}"
+          if [ "$CHANGED" = "true" ] || [ "$FORCE" = "true" ]; then
+            echo "dispatching build-apk.yml (changed=$CHANGED force=$FORCE)"
+            gh workflow run build-apk.yml --ref main
+            sleep 8
+            gh run list --workflow build-apk.yml --limit 2
+          else
+            echo "upstream 无更新且未强制，跳过构建"
+          fi
