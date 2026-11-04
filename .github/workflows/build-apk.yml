@@ -59,7 +59,7 @@ jobs:
   apk:
     needs: android-runtime
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 350
     env:
       RUSTFLAGS: -Awarnings
     steps:
@@ -121,9 +121,23 @@ jobs:
           echo "$SDK/platform-tools" >> "$GITHUB_PATH"
           yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
-          SO=$(ls /usr/lib/llvm-*/lib/libclang.so* /usr/lib/x86_64-linux-gnu/libclang-*.so* 2>/dev/null | head -n1)
-          sudo ln -sf "$SO" /usr/lib/libclang.so
+          # V8 source bindings require libclang 21.1+: install LLVM 21 and expose libclang.so.21
+          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          sudo apt-get install -y libclang-21-dev lld-21
+          sudo ln -sf /usr/lib/llvm-21/lib/libclang.so.1 /usr/lib/libclang.so.21
+          sudo ln -sf /usr/lib/llvm-21/lib/libclang.so.1 /usr/lib/libclang.so
+          ls -l /usr/lib/libclang.so.21
           echo "OPERIT_LIBCLANG_DIR=/usr/lib" >> "$GITHUB_ENV"
+
+      - name: Cache Android V8 build
+        uses: actions/cache@v4
+        with:
+          path: tools/release/work/android-v8
+          key: android-v8-${{ hashFiles('apps/flutter/native/operit-flutter-bridge/Cargo.lock', 'tools/build_scripts/prepare_android_v8.py') }}
+          restore-keys: |
+            android-v8-
 
       - name: Install project Flutter SDK
         working-directory: apps/flutter/app
