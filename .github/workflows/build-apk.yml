@@ -159,10 +159,21 @@ jobs:
           name: android-runtime
           path: apps/flutter/app/android/app/src/main
 
-      - uses: actions/download-artifact@v4
+      - name: Restore source-built V8 (cache keeps exec bits)
+        uses: actions/cache@v4
         with:
-          name: android-v8
-          path: .
+          path: |
+            tools/release/work/android-v8
+            apps/flutter/native/operit-flutter-bridge/target/operit-v8
+          key: android-v8-${{ hashFiles('apps/flutter/native/operit-flutter-bridge/Cargo.lock', 'tools/build_scripts/prepare_android_v8.py') }}
+          restore-keys: |
+            android-v8-
+
+      - name: Ensure V8 tools are executable
+        run: |
+          chmod -R u+x tools/release/work/android-v8 apps/flutter/native/operit-flutter-bridge/target/operit-v8
+          find tools/release/work/android-v8 -name gn -o -name ninja | xargs -r chmod +x
+          ls -l apps/flutter/native/operit-flutter-bridge/target/operit-v8/
 
       - uses: actions/setup-java@v4
         with:
