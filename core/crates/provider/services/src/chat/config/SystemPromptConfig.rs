@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use operit_host_api::{HostEnvironmentDescriptor, HostPlatform};
+use operit_host_api::HostEnvironmentDescriptor;
 use operit_tools::files::PathMapper::ResolvedVfsPath;
 use serde_json::{json, Value};
 
@@ -123,13 +123,24 @@ pub struct WorkspaceRuleFile {
     pub content: String,
 }
 
+/// Paths returned by the selected terminal Host, including mapping failures.
+#[derive(Clone, Debug)]
+pub struct TerminalPathMapping {
+    pub terminal: String,
+    pub terminal_type: String,
+    pub vfs_path: String,
+    pub path: Result<String, String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SystemPromptOptions {
     pub chat_id: Option<String>,
     pub workspace_path: Option<String>,
+    pub output_path: Option<String>,
     pub workspace_folders: Vec<String>,
     /// VFS roots mapped to absolute host paths by the active file-tool mapper.
     pub workspace_path_mappings: Vec<ResolvedVfsPath>,
+    pub terminal_path_mappings: Vec<TerminalPathMapping>,
     pub saf_bookmark_names: Vec<String>,
     pub use_english: bool,
     pub custom_system_prompt_template: String,
@@ -158,8 +169,10 @@ impl Default for SystemPromptOptions {
         Self {
             chat_id: None,
             workspace_path: None,
+            output_path: None,
             workspace_folders: Vec::new(),
             workspace_path_mappings: Vec::new(),
+            terminal_path_mappings: Vec::new(),
             saf_bookmark_names: Vec::new(),
             use_english: false,
             custom_system_prompt_template: String::new(),
@@ -250,9 +263,9 @@ impl SystemPromptConfig {
 
         let workspace_guidelines = getWorkspaceGuidelines(
             options.workspace_path.as_deref(),
+            options.output_path.as_deref(),
             &options.workspace_folders,
-            &options.workspace_path_mappings,
-            &options.host_environment.platform,
+            &options.terminal_path_mappings,
             options.use_english,
             options.workspace_rule_file.as_ref(),
         );
@@ -378,6 +391,8 @@ impl SystemPromptConfig {
         if options.enable_tools {
             prompt.push_str("\n\n");
             prompt.push_str(getAttachmentGuidelines(options.use_english));
+            prompt.push_str("\n\n");
+            prompt.push_str(&getFileSyncGuidelines(options.use_english));
         }
 
         Ok(collapse_blank_lines(&prompt))
@@ -533,103 +548,121 @@ fn buildWorkspaceRuleFileSection(
     }
 }
 
-/// Attachment files persist node-locally across restarts; metadata does not copy their bytes.
+/// Describes attachment paths from the same directory used by file tools and terminals.
 #[allow(non_snake_case)]
 fn getAttachmentGuidelines(use_english: bool) -> &'static str {
     if use_english {
-        "ATTACHMENT LOCATIONS:\n- An attachment's `node_id` identifies the CoreNode that actually holds its file; it is not necessarily the current execution node. Node metadata does not transfer or synchronize the file.\n- Use content already embedded in the message directly. To access a file, use `list_core_nodes` to check the current node and source reachability. If the source differs, call `switch_core` with the exact `node_id` and wait for continuation on that node before using file tools; switching changes this chat's execution node. Use the attachment's `path` VFS locator for file tools. Client-local physical paths are not exposed in attachment metadata. If no `path` is provided, use embedded content or request re-upload; do not guess a physical path or search for a mapping. Do not search the current device for another device's file.\n- Files under `/operitapp/data/data/chat_attachments` are persistent and remain readable across restarts on the node that holds them; they are not Space-synchronized. Attachments without a `path` may be legacy or missing; ask the user to re-upload instead of searching unrelated directories. Legacy attachments without `node_id` have an unknown source; do not invent one."
+        "ATTACHMENTS:\n- Attachment `path` is relative to `.`. File tools and terminal sessions use this same base. Read supplied relative attachment paths directly, including `..`; use embedded content directly.\n- Small attachments contain the file; large attachments use `.operit-ref.json` with the source `node_id` and VFS path.\n- Check the current node first. For a missing file, use `list_core_nodes` and access its source with file tools. For terminal access, use `switch_core` and the source Host's resolved path.\n- If the path is missing, use embedded content or request re-upload. For terminal startup errors, report the error and use file tools."
     } else {
-        "附件位置：\n- 附件的 `node_id` 是文件实际所在的 CoreNode，不一定是当前执行节点；携带节点信息不代表文件已传输或同步。\n- 消息中已经内嵌的内容可直接使用。需要访问文件时，先用 `list_core_nodes` 确认当前节点和来源节点是否可达；来源不同则用精确的 `node_id` 调用 `switch_core`，等待在目标节点继续执行后再调用文件工具。切换会改变这段聊天的执行节点。文件工具使用附件的 `path` VFS 地址；附件元数据不暴露客户端物理路径。没有 `path` 时，使用内嵌内容或请用户重新上传，不要猜测物理路径或搜索映射。不要在当前设备搜索另一台设备的文件。\n- `/operitapp/data/data/chat_attachments` 下的文件持久保存，重启后仍可在持有它的节点上读取；不参与 Space 文件同步。没有 `path` 的附件可能是旧格式或已缺失，请用户重新上传，不要搜索无关目录。旧附件没有 `node_id` 时来源未知，不得猜测补成当前节点。"
+        "附件：\n- 附件 `path` 相对于 `.`，文件工具与终端使用同一个基准。直接读取附件提供的相对路径，支持 `..`；内嵌内容直接使用。\n- 小附件保存文件本体；大附件通过 `.operit-ref.json` 记录来源 `node_id` 和 VFS 路径。\n- 先读取当前节点；文件缺失时，通过 `list_core_nodes` 检查来源并用文件工具读取。终端访问来源文件时，使用 `switch_core` 和来源 Host 解析的路径。\n- 路径缺失时使用内嵌内容或请求重新上传；终端启动失败时报告错误并使用文件工具。"
     }
 }
 
-/// Builds workspace instructions with every mounted folder visible to the model.
+/// Keeps sync policy instructions tied to the implementation's actual default schema.
+#[allow(non_snake_case)]
+fn getFileSyncGuidelines(use_english: bool) -> String {
+    let example = serde_json::to_string_pretty(&operit_store::FileSyncPolicy::FileSyncPolicy::default())
+        .expect("The default file sync policy must serialize");
+    let guidance = if use_english {
+        "FILE SYNC POLICY:
+- Read `.operit/sync.json` before installing dependencies, building, downloading or generating files in bulk. Preserve existing rules and limits; add exclusions first.
+- Use valid JSON: `version` is 1; `ignoreFiles` lists relative ignore files; `.gitignore` includes nested rules; `exclude` uses Gitignore patterns (`dir/`, `*.tmp`, `!path`).
+- Exclude dependency, build, cache, log, temporary and bulk-data directories (e.g. `.venv/`, `.cache/`, `coverage/`). Keep `.operit/` and final deliverables available. External mounts and symlinks are managed at their source.
+- `maxFileBytes` and `maxTotalBytes` limit automatic copying per file and root, in bytes. Oversized files share `.operit-ref.json` locators; originals stay at the source. Policy changes affect subsequent copying and retain existing copies.
+- Default policy; merge changes into the existing file:"
+    } else {
+        "文件同步：
+- 安装依赖、构建、下载或批量生成文件前，读取 `.operit/sync.json`，保留已有规则和限额，先补充排除项。
+- 使用合法 JSON：`version` 为 1；`ignoreFiles` 填相对路径，`.gitignore` 包含各级规则；`exclude` 使用 Gitignore 语法（`dir/`、`*.tmp`、`!path`）。
+- 按目录排除依赖、构建、缓存、日志、临时文件和批量数据（如 `.venv/`、`.cache/`、`coverage/`）；保留 `.operit/` 与最终交付文件。外部挂载和软链接由来源管理。
+- `maxFileBytes`、`maxTotalBytes` 分别限制单文件和目录的自动复制字节量。超限文件分享 `.operit-ref.json`，原件留在来源。规则调整作用于后续复制，已有副本保留。
+- 默认配置如下，修改时合并已有内容："
+    };
+    format!("{guidance}
+```json
+{example}
+```")
+}
+
 #[allow(non_snake_case)]
 fn getWorkspaceGuidelines(
     workspace_path: Option<&str>,
+    output_path: Option<&str>,
     workspace_folders: &[String],
-    workspace_path_mappings: &[ResolvedVfsPath],
-    host_platform: &HostPlatform,
+    terminal_path_mappings: &[TerminalPathMapping],
     use_english: bool,
     workspace_rule_file: Option<&WorkspaceRuleFile>,
 ) -> String {
-    let Some(workspace_path) = workspace_path else {
-        return String::new();
+    let Some(workspace_path) = workspace_path.filter(|p| !p.trim().is_empty()) else {
+        let Some(output) = output_path else { return String::new(); };
+        let text = if use_english {
+            "CONVERSATION OUTPUT DIRECTORY:\n- `.` is the conversation output area.\n- File tools and terminal sessions start from `.`. Use relative paths for attachments, outputs and Markdown links."
+        } else {
+            "对话产出目录：\n- `.` 是对话产出区域。\n- 文件工具与终端从 `.` 开始，附件、产出及 Markdown 引用使用相对路径。"
+        };
+        return format!("{text}\n\n{}", buildWorkspaceTerminalPathSection(terminal_path_mappings, output, use_english, true));
     };
-    if workspace_path.trim().is_empty() {
-        return String::new();
-    }
     let mut seen = std::collections::HashSet::new();
     let mounted_folders = std::iter::once(workspace_path)
         .chain(workspace_folders.iter().map(String::as_str))
         .filter(|folder| !folder.trim().is_empty())
-        .filter(|folder| seen.insert(folder.trim_end_matches('/').to_string()))
+        .filter_map(|folder| operit_tools::files::PathMapper::PathMapper::relativeFileToolPath(workspace_path, folder).ok())
+        .filter(|folder| seen.insert(folder.clone()))
         .map(|folder| format!("- `{folder}`"))
         .collect::<Vec<_>>()
         .join("\n");
     let base_guidelines = if use_english {
         format!(
-            "WORKSPACE GUIDELINES:\n- Primary workspace: `{workspace_path}`. Workspace folders:\n{mounted_folders}\n- Prefer relative file-tool paths such as `.` and `src/file`; they resolve against the primary workspace. Use a listed absolute VFS path for other folders.\n- Terminal sessions start in the workspace when supported; terminal paths and VFS paths can differ. If changing directories, use the terminal-visible path.\n- `nodeName:path` addresses another device. Workspace body files synchronize eventually; external mounts, symlinks and temporary attachments are not automatically synchronized. Verify files have arrived before use."
+            "WORKSPACE:\n- `.` is the primary workspace. Folder paths:\n{mounted_folders}\n- File tools and terminal sessions start from `.`. Use relative paths for attachments, outputs and Markdown links. Use Host-resolved paths for terminal access to other mounts.\n- `nodeName:path` addresses another device. Files synchronize eventually; verify arrival before use."
         )
     } else {
         format!(
-            "工作区指南：\n- 主工作区：`{workspace_path}`。工作区文件夹：\n{mounted_folders}\n- 文件工具优先使用 `.`、`src/file` 等相对路径，以主工作区为基准；访问其他文件夹时使用列出的 VFS 绝对路径。\n- 支持时终端会进入工作区；终端路径与 VFS 路径可能不同，切换目录时使用终端可见路径。\n- `nodeName:path` 指向其他设备。工作区本体文件是最终一致同步；外部挂载、软链接和临时附件不会自动同步，使用前请确认文件已到达。"
+            "工作区：\n- `.` 是主工作区。文件夹路径：\n{mounted_folders}\n- 文件工具与终端从 `.` 开始，附件、产出及 Markdown 引用使用相对路径。终端访问其他挂载时使用 Host 解析的路径。\n- `nodeName:path` 指向其他设备。文件最终一致同步，使用前确认已到达。"
         )
     };
-    let terminal_section =
-        buildWorkspaceTerminalPathSection(workspace_path_mappings, host_platform, use_english);
+    let terminal_section = buildWorkspaceTerminalPathSection(terminal_path_mappings, workspace_path, use_english, false);
     let rule_section = buildWorkspaceRuleFileSection(workspace_rule_file, use_english);
-    [base_guidelines, terminal_section, rule_section]
-        .into_iter()
-        .filter(|section| !section.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    [base_guidelines, terminal_section, rule_section].into_iter()
+        .filter(|section| !section.is_empty()).collect::<Vec<_>>().join("\n\n")
 }
 
-/// Distinguishes virtual file-tool paths from terminal-visible filesystem paths.
+/// Describes terminal availability at `.` and resolved paths for additional mounts.
 #[allow(non_snake_case)]
 fn buildWorkspaceTerminalPathSection(
-    mappings: &[ResolvedVfsPath],
-    host_platform: &HostPlatform,
+    mappings: &[TerminalPathMapping],
+    primary: &str,
     use_english: bool,
+    is_output: bool,
 ) -> String {
-    if *host_platform == HostPlatform::Web {
-        return if use_english {
-            "TERMINAL WORKSPACE PATHS:\n- The browser terminal mounts workspace storage. Use relative paths from the initial workspace directory."
-        } else {
-            "终端工作区路径：\n- 浏览器终端挂载工作区存储，优先使用相对于初始工作目录的路径。"
-        }.to_string();
-    }
+    let header = match (use_english, is_output) {
+        (true, true) => "TERMINAL OUTPUT DIRECTORY",
+        (true, false) => "TERMINAL WORKSPACE PATHS",
+        (false, true) => "终端产出目录",
+        (false, false) => "终端工作区路径",
+    };
     if mappings.is_empty() {
-        return if use_english {
-            "TERMINAL WORKSPACE PATHS:\n- No absolute host path mapping is available for this workspace. Do not assume `/operitapp/workspaces` exists in the terminal or guess its physical location; use file tools for workspace files."
+        return format!("{header}:\n{}", if use_english {
+            "- Use file tools; terminal mapping is unavailable."
         } else {
-            "终端工作区路径：\n- 当前工作区没有可用的宿主绝对路径映射。不要假设终端中存在 `/operitapp/workspaces`，也不要猜测其物理位置；请使用文件工具访问工作区文件。"
-        }.to_string();
+            "- 当前使用文件工具，终端路径映射待配置。"
+        });
     }
     let paths = mappings.iter().map(|mapping| {
-        if *host_platform == HostPlatform::Ohos {
-            // QEMU-vroot mounts the native host root at /mnt/host-root.
-            if use_english {
-                format!("- File tools (VFS): `{}` → Native terminal: `{}`; QEMU-vroot terminal: `/mnt/host-root{}`",
-                    mapping.vfsPath, mapping.physicalPath, mapping.physicalPath)
-            } else {
-                format!("- 文件工具（VFS）：`{}` → 原生终端：`{}`；QEMU-vroot 终端：`/mnt/host-root{}`",
-                    mapping.vfsPath, mapping.physicalPath, mapping.physicalPath)
-            }
-        } else if use_english {
-            format!("- File tools (VFS): `{}` → Terminal absolute path: `{}`",
-                mapping.vfsPath, mapping.physicalPath)
-        } else {
-            format!("- 文件工具（VFS）：`{}` → 终端绝对路径：`{}`",
-                mapping.vfsPath, mapping.physicalPath)
+        let label = format!("{}/{}", mapping.terminal, mapping.terminal_type);
+        let relative = operit_tools::files::PathMapper::PathMapper::relativeFileToolPath(primary, &mapping.vfs_path)
+            .unwrap_or_else(|_| mapping.vfs_path.clone());
+        match &mapping.path {
+            Ok(_) if relative == "." => format!("- `{label}`: `.`"),
+            Ok(path) => format!("- `{label}`: `{relative}` → `{path}`"),
+            Err(error) => format!("- `{label}`: `{relative}`: {error}"),
         }
     }).collect::<Vec<_>>().join("\n");
-    if use_english {
-        format!("TERMINAL WORKSPACE PATHS (resolved by the host):\n{paths}\n- Sessions start in the primary workspace when supported. Use relative paths; after changing directories, use the appropriate terminal path to return.")
+    let guidance = if use_english {
+        "Each selected Host starts its sessions at `.`. Record `pwd` before `cd`; file tools keep their original base. For mapping errors, report the error and use file tools."
     } else {
-        format!("终端工作区路径（由宿主解析）：\n{paths}\n- 支持时会话从主工作区启动，优先使用相对路径；更改目录后，可使用对应终端路径返回。")
-    }
+        "所选 Host 从 `.` 启动终端。`cd` 前记录 `pwd`，文件工具始终使用原基准。映射失败时报告错误并使用文件工具。"
+    };
+    format!("{header} (Host):\n{paths}\n- {guidance}")
 }
 
 fn build_cli_mode_prompt(use_english: bool) -> String {
@@ -712,13 +745,14 @@ mod tests {
             .await.expect("Tool-prompt policies must succeed in this test");
             assert!(prompt.contains("node_id"));
             assert!(prompt.contains("switch_core"));
-            assert!(prompt.contains("/operitapp/data/data/chat_attachments"));
+            assert!(prompt.contains(".operit/sync.json"));
+            assert!(prompt.contains(".operit-ref.json"));
             assert!(!prompt.contains("resolve `id`"));
             assert!(!prompt.contains("物理路径 `id`"));
             assert!(prompt.contains(if use_english {
-                "Client-local physical paths are not exposed"
+                "Check the current node first"
             } else {
-                "附件元数据不暴露客户端物理路径"
+                "先读取当前节点"
             }));
         }
     }
@@ -734,10 +768,40 @@ mod tests {
             .await.expect("Tool-prompt policies must succeed in this test");
             if use_english {
                 assert!(prompt.contains("synchronize eventually"));
-                assert!(prompt.contains("external mounts, symlinks and temporary attachments are not automatically synchronized"));
+                assert!(prompt.contains("External mounts and symlinks are managed at their source"));
+                assert!(prompt.contains(".operit/sync.json"));
             } else {
                 assert!(prompt.contains("最终一致"));
-                assert!(prompt.contains("外部挂载、软链接和临时附件不会自动同步"));
+                assert!(prompt.contains("外部挂载和软链接由来源管理"));
+                assert!(prompt.contains(".operit/sync.json"));
+            }
+        }
+    }
+
+    /// Workspaces, unbound output areas and custom templates all carry executable policy guidance.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_policy_instructions_cover_schema_and_proactive_exclusion_in_both_languages() {
+        let defaults = serde_json::to_string_pretty(&operit_store::FileSyncPolicy::FileSyncPolicy::default()).unwrap();
+        for use_english in [true, false] {
+            for workspace in [None, Some("/operitapp/workspaces/project".to_string())] {
+                let prompt = SystemPromptConfig::getSystemPrompt(SystemPromptOptions {
+                    use_english,
+                    workspace_path: workspace,
+                    output_path: Some("/operitapp/outputs/family".into()),
+                    custom_system_prompt_template: "Custom instructions".into(),
+                    ..SystemPromptOptions::default()
+                }).await.unwrap();
+                assert!(prompt.contains(&format!("```json\n{defaults}\n```")));
+                for field in ["version", "ignoreFiles", "exclude", "maxFileBytes", "maxTotalBytes"] {
+                    assert!(prompt.contains(field), "missing policy field {field}");
+                }
+                for pattern in ["node_modules/", "build/", ".gitignore", ".venv/", ".cache/", "coverage/", "!path"] {
+                    assert!(prompt.contains(pattern), "missing exclusion guidance {pattern}");
+                }
+                assert!(prompt.contains(if use_english { "add exclusions first" } else { "先补充排除项" }));
+                assert!(prompt.contains(if use_english { "Exclude dependency, build, cache, log, temporary and bulk-data directories" } else { "按目录排除" }));
+                assert!(prompt.contains(if use_english { "Preserve existing rules and limits" } else { "保留已有规则和限额" }));
+                assert!(prompt.contains(if use_english { "Keep `.operit/` and final deliverables available" } else { "保留 `.operit/` 与最终交付文件" }));
             }
         }
     }
@@ -756,10 +820,10 @@ mod tests {
         })
         .await.expect("Tool-prompt policies must succeed in this test");
 
-        assert!(prompt.contains("/operitapp/workspaces/test"));
-        assert!(prompt.contains("/virtual/windows/d/Code/stm32"));
-        assert!(prompt.contains("Use a listed absolute VFS path for other folders"));
-        assert!(prompt.contains("Prefer relative file-tool paths"));
+        assert!(prompt.contains("`.` is the primary workspace"));
+        assert!(prompt.contains("../../../virtual/windows/d/Code/stm32"));
+        assert!(prompt.contains("Use relative paths for attachments, outputs and Markdown"));
+        assert!(!prompt.contains("/operitapp/workspaces/test"));
         assert!(!prompt.contains("not in file-tool path parameters"));
     }
 
@@ -770,6 +834,10 @@ mod tests {
             workspace_folders: vec![
                 "/operitapp/workspaces/main".into(),
                 "/operitapp/workspaces/library".into(),
+            ],
+            terminal_path_mappings: vec![
+                super::TerminalPathMapping { terminal: "native".into(), terminal_type: "shell".into(), vfs_path: "/operitapp/workspaces/main".into(), path: Ok("/Users/test/My Projects/main".into()) },
+                super::TerminalPathMapping { terminal: "native".into(), terminal_type: "shell".into(), vfs_path: "/operitapp/workspaces/library".into(), path: Ok("/Users/test/My Projects/library".into()) },
             ],
             workspace_path_mappings: vec![
                 super::ResolvedVfsPath {
@@ -794,12 +862,12 @@ mod tests {
                     options.tool_exposure_mode = mode.clone();
                     options.use_tool_call_api = use_tool_call_api;
                     let prompt = SystemPromptConfig::getSystemPrompt(options).await.expect("Tool-prompt policies must succeed in this test");
-                    assert!(prompt.contains("/Users/test/My Projects/main"));
+                    assert!(prompt.contains("`native/shell`: `.`"));
                     assert!(prompt.contains("/Users/test/My Projects/library"));
                     assert!(prompt.contains(if use_english {
-                        "Sessions start in the primary workspace when supported"
+                        "Each selected Host starts its sessions at `.`"
                     } else {
-                        "支持时会话从主工作区启动"
+                        "所选 Host 从 `.` 启动终端"
                     }));
                 }
             }
@@ -816,7 +884,7 @@ mod tests {
             options.custom_system_prompt_template = template.into();
             let prompt = SystemPromptConfig::getSystemPrompt(options).await.expect("Tool-prompt policies must succeed in this test");
             assert!(prompt.contains("Custom instructions."));
-            assert!(prompt.contains("/Users/test/My Projects/main"));
+            assert!(prompt.contains("`native/shell`: `.`"));
             assert_eq!(prompt.matches("TERMINAL WORKSPACE PATHS").count(), 1);
             assert!(!prompt.contains("WORKSPACE_GUIDELINES_SECTION"));
         }
@@ -841,63 +909,82 @@ mod tests {
         }
     }
 
+    /// Every tool protocol and custom template must retain the relative-path contract.
     #[tokio::test(flavor = "current_thread")]
-    async fn unbound_workspace_prompt_explains_file_discovery() {
+    async fn chat_file_prompt_uses_the_same_relative_base_without_attachment_searches() {
         for use_english in [false, true] {
-            let prompt = SystemPromptConfig::getSystemPrompt(SystemPromptOptions {
-                use_english,
-                workspace_path: None,
-                ..SystemPromptOptions::default()
-            }).await.expect("Tool-prompt policies must succeed in this test");
-            assert!(prompt.contains(if use_english {
-                "Without a workspace, list `/`"
-            } else {
-                "没有工作区时，可列出 `/`"
-            }));
-            assert!(prompt.contains(if use_english {
-                "VFS paths are not necessarily terminal paths"
-            } else {
-                "VFS 路径不一定是终端路径"
-            }));
+            for workspace_path in [None, Some("/operitapp/workspaces/project".to_string())] {
+                for (use_tool_call_api, tool_exposure_mode) in [
+                    (false, super::ToolExposureMode::FULL),
+                    (true, super::ToolExposureMode::FULL),
+                    (false, super::ToolExposureMode::CLI),
+                ] {
+                    for template in ["", "Custom instructions"] {
+                        let prompt = SystemPromptConfig::getSystemPrompt(SystemPromptOptions {
+                            use_english,
+                            workspace_path: workspace_path.clone(),
+                            output_path: Some("/operitapp/outputs/family".into()),
+                            use_tool_call_api,
+                            tool_exposure_mode: tool_exposure_mode.clone(),
+                            custom_system_prompt_template: template.into(),
+                            ..SystemPromptOptions::default()
+                        }).await.expect("Tool-prompt policies must succeed in this test");
+                        assert!(prompt.contains(if use_english {
+                            "File tools and terminal sessions use this same base"
+                        } else {
+                            "文件工具与终端使用同一个基准"
+                        }));
+                        assert!(prompt.contains(if use_english {
+                            "Read supplied relative attachment paths directly"
+                        } else {
+                            "直接读取附件提供的相对路径"
+                        }));
+                        assert!(prompt.contains(if use_english {
+                            "For terminal startup errors"
+                        } else {
+                            "终端启动失败时报告错误"
+                        }));
+                        assert!(!prompt.contains("Relative file paths require a workspace"));
+                        assert!(!prompt.contains("Without a workspace, list `/`"));
+                        assert!(!prompt.contains("文件相对路径需要绑定工作区"));
+                        assert!(!prompt.contains("没有工作区时，可列出 `/`"));
+                    }
+                }
+            }
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn workspacePromptDoesNotGuessUnresolvedTerminalPaths() {
         let mut options = workspacePromptOptions(true);
-        options.workspace_path_mappings.clear();
+        options.terminal_path_mappings.clear();
         let prompt = SystemPromptConfig::getSystemPrompt(options).await.expect("Tool-prompt policies must succeed in this test");
-        assert!(prompt.contains("No absolute host path mapping is available"));
+        assert!(prompt.contains("terminal mapping is unavailable"));
         assert!(!prompt.contains("Terminal absolute path:"));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn workspacePromptDistinguishesOhosNativeAndVrootPaths() {
+    async fn workspacePromptUsesExactHostMappingsForEachTerminal() {
         let mut options = workspacePromptOptions(true);
-        options.host_environment.platform = super::HostPlatform::Ohos;
-        let prompt = SystemPromptConfig::getSystemPrompt(options).await.expect("Tool-prompt policies must succeed in this test");
-        assert!(prompt.contains("Native terminal: `/Users/test/My Projects/main`"));
-        assert!(
-            prompt.contains("QEMU-vroot terminal: `/mnt/host-root/Users/test/My Projects/main`")
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn workspacePromptDoesNotTreatBrowserStorageAsVmDirectories() {
-        let mut options = workspacePromptOptions(true);
-        options.host_environment.platform = super::HostPlatform::Web;
-        let prompt = SystemPromptConfig::getSystemPrompt(options).await.expect("Tool-prompt policies must succeed in this test");
-        assert!(prompt.contains("browser terminal mounts workspace storage"));
+        options.terminal_path_mappings = vec![
+            super::TerminalPathMapping { terminal: "native".into(), terminal_type: "shell".into(), vfs_path: "/operitapp/workspaces/main".into(), path: Ok("/native/custom/project".into()) },
+            super::TerminalPathMapping { terminal: "guest".into(), terminal_type: "bash".into(), vfs_path: "/operitapp/workspaces/main".into(), path: Ok("/guest/custom/project".into()) },
+            super::TerminalPathMapping { terminal: "unavailable".into(), terminal_type: "shell".into(), vfs_path: "/operitapp/workspaces/main".into(), path: Err("Document mounts cannot be terminal directories".into()) },
+        ];
+        let prompt = SystemPromptConfig::getSystemPrompt(options).await.unwrap();
+        assert!(prompt.contains("`native/shell`: `.`"));
+        assert!(prompt.contains("`guest/bash`: `.`"));
+        assert!(prompt.contains("Document mounts cannot be terminal directories"));
         assert!(!prompt.contains("/Users/test/My Projects"));
+        assert!(!prompt.contains("/mnt/host-root"));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn workspacePromptIncludesWindowsDrivePathsWithoutRewritingThem() {
+    async fn workspacePromptIncludesHostDrivePathsWithoutRewritingThem() {
         let mut options = workspacePromptOptions(true);
-        options.host_environment.platform = super::HostPlatform::Windows;
-        options.workspace_path_mappings[0].physicalPath = "D:/My Projects/main".into();
-        let prompt = SystemPromptConfig::getSystemPrompt(options).await.expect("Tool-prompt policies must succeed in this test");
-        assert!(prompt.contains("Terminal absolute path: `D:/My Projects/main`"));
+        options.terminal_path_mappings[1].path = Ok("D:/My Projects/library".into());
+        let prompt = SystemPromptConfig::getSystemPrompt(options).await.unwrap();
+        assert!(prompt.contains("`../library` → `D:/My Projects/library`"));
     }
 
     struct LanguageHookProbe {
@@ -947,6 +1034,21 @@ mod tests {
                 "build_tool_prompt", "before_compose_tool_prompt",
                 "filter_tool_prompt_items", "after_compose_tool_prompt",
             ]);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unbound_output_directory_uses_a_concise_relative_base() {
+        for use_english in [true, false] {
+            let prompt = SystemPromptConfig::getSystemPrompt(SystemPromptOptions {
+                use_english, output_path: Some("/operitapp/outputs/family".into()),
+                ..SystemPromptOptions::default()
+            }).await.unwrap();
+            assert!(!prompt.contains("/operitapp/outputs/family"));
+            assert!(prompt.contains("`.`"));
+            assert!(prompt.contains(".operit-ref.json"));
+            assert!(prompt.contains(if use_english { "`.` is the conversation output area." } else { "`.` 是对话产出区域。" }));
+            assert!(!prompt.contains(if use_english { "Sessions start in the primary workspace" } else { "会话从主工作区启动" }));
         }
     }
 
