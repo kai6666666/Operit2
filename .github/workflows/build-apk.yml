@@ -4,16 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       build_name:
-        description: "versionName"
+        description: "versionName（留空=自动读 pubspec）"
         required: false
-        default: "2.0.0"
+        default: ""
       build_number:
-        description: "versionCode"
+        description: "versionCode（留空=自动读 pubspec）"
         required: false
-        default: "24"
+        default: ""
+      publish_release:
+        description: "是否创建 GitHub Release（true/false）"
+        required: false
+        default: "true"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   android-runtime:
@@ -89,6 +93,18 @@ jobs:
           toolchain: 1.95.0
           targets: aarch64-linux-android
 
+      - name: Resolve version
+        id: version
+        run: |
+          RAW=$(sed -n 's/^version:[[:space:]]*//p' apps/flutter/app/pubspec.yaml | head -n1)
+          NAME="${RAW%%+*}"
+          CODE="${RAW##*+}"
+          if [ -n "${{ inputs.build_name }}" ]; then NAME="${{ inputs.build_name }}"; fi
+          if [ -n "${{ inputs.build_number }}" ]; then CODE="${{ inputs.build_number }}"; fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "resolved versionName=$NAME versionCode=$CODE"
+
       - name: Install Android SDK, NDK and libclang
         run: |
           sudo apt-get update
@@ -129,27 +145,52 @@ jobs:
           python3 -m venv .venv
           .venv/bin/python --version
 
-      - name: Prepare Android signing
+      - name: Restore Android signing from secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "missing ANDROID_KEYSTORE_BASE64 secret" >&2
+            exit 1
+          fi
           mkdir -p tools/release/secrets
-          keytool -genkeypair -v -keystore tools/release/secrets/operit2-release.keystore -storetype PKCS12 -alias operit2 -keyalg RSA -keysize 2048 -validity 10000 -storepass operit2preview -keypass operit2preview -dname "CN=Operit2 Preview,O=Local,C=CN"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > tools/release/secrets/operit2-release.keystore
           printf '%s\n' \
             'RELEASE_STORE_FILE=operit2-release.keystore' \
-            'RELEASE_STORE_PASSWORD=operit2preview' \
-            'RELEASE_KEY_ALIAS=operit2' \
-            'RELEASE_KEY_PASSWORD=operit2preview' > tools/release/secrets/android-signing.properties
-          cat tools/release/secrets/android-signing.properties
+            "RELEASE_STORE_PASSWORD=$ANDROID_STORE_PASSWORD" \
+            "RELEASE_KEY_ALIAS=$ANDROID_KEY_ALIAS" \
+            "RELEASE_KEY_PASSWORD=$ANDROID_KEY_PASSWORD" > tools/release/secrets/android-signing.properties
+          keytool -list -keystore tools/release/secrets/operit2-release.keystore -storepass "$ANDROID_STORE_PASSWORD" | tail -3
 
       - name: Build release APK (arm64-v8a)
         run: |
-          python3 tools/build_scripts/build_flutter_android.py --build-name "${{ inputs.build_name }}" --build-number "${{ inputs.build_number }}" --enforce-lockfile
+          python3 tools/build_scripts/build_flutter_android.py --build-name "${{ steps.version.outputs.name }}" --build-number "${{ steps.version.outputs.code }}" --enforce-lockfile
 
       - name: Show APK
-        run: ls -lh tools/release/dist/
+        run: |
+          ls -lh tools/release/dist/
+          sha256sum tools/release/dist/*.apk | tee tools/release/dist/SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: operit2-apk
-          path: tools/release/dist/*.apk
+          path: |
+            tools/release/dist/*.apk
+            tools/release/dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release != 'false' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="apk-$(date -u +%Y%m%d-%H%M)-$(git rev-parse --short HEAD)"
+          gh release create "$TAG" tools/release/dist/*.apk tools/release/dist/SHA256SUMS.txt \
+            --title "Operit2 ${{ steps.version.outputs.name }} (${{ steps.version.outputs.code }}) · $TAG" \
+            --notes "自动构建 · 上游 ${{ github.sha }} · versionName ${{ steps.version.outputs.name }} · versionCode ${{ steps.version.outputs.code }} · arm64-v8a · 固定 keystore 签名" \
+            --latest
+          echo "release: $TAG"
