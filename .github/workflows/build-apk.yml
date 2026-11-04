@@ -31,8 +31,38 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bison build-essential bzip2 ca-certificates curl diffutils flex gawk gzip patch pkg-config tar unzip xz-utils
 
+      - name: Cache Android runtime sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools/android-runtime/downloads
+            tools/android-runtime/sources
+          key: android-runtime-sources-v1
+
       - name: Fetch Android runtime sources
-        run: pwsh -NoProfile -File tools/android-runtime/fetch_sources.ps1
+        run: |
+          set -euo pipefail
+          cd tools/android-runtime
+          mkdir -p downloads sources
+          grab() {
+            url="$1"; fallback="$2"; archive="$3"; sha="$4"
+            if [ ! -f "downloads/$archive" ]; then
+              curl -fL --retry 6 --retry-all-errors --retry-delay 5 -o "downloads/$archive" "$url" \
+                || curl -fL --retry 6 --retry-all-errors --retry-delay 5 -o "downloads/$archive" "$fallback"
+            fi
+            echo "$sha  downloads/$archive" | sha256sum -c -
+          }
+          grab "https://busybox.net/downloads/busybox-1.38.0.tar.bz2" "https://mirrors.kernel.org/busybox/busybox-1.38.0.tar.bz2" "busybox-1.38.0.tar.bz2" "34F9EA6FF8636F2C9241153B9114EEFA9E65674A45318AE1EF95BB5F31C53BB2"
+          grab "https://github.com/termux/proot/archive/refs/tags/v5.1.107.78.tar.gz" "https://codeload.github.com/termux/proot/tar.gz/refs/tags/v5.1.107.78" "termux-proot-v5.1.107.78.tar.gz" "F3377BA49DCD833370420C34C5081B4C243ECBB85B2A9881A4F4586012599AFA"
+          grab "https://www.samba.org/ftp/talloc/talloc-2.4.3.tar.gz" "https://download.samba.org/pub/talloc/talloc-2.4.3.tar.gz" "talloc-2.4.3.tar.gz" "DC46C40B9F46BB34DD97FE41F548B0E8B247B77A918576733C528E83ABD854DD"
+          grab "https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz" "https://mirrors.kernel.org/gnu/bash/bash-5.2.37.tar.gz" "bash-5.2.37.tar.gz" "9599B22ECD1D5787AD7D3B7BF0C59F312B3396D1E281175DD1F8A4014DA621FF"
+          for archive in downloads/*; do
+            case "$archive" in
+              *.tar.bz2) tar -xjf "$archive" -C sources ;;
+              *.tar.gz) tar -xzf "$archive" -C sources ;;
+            esac
+          done
+          ls sources
 
       - name: Fetch Android NDK r29 beta4
         run: bash tools/android-runtime/fetch_ndk_wsl.sh
