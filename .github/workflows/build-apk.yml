@@ -86,10 +86,63 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  apk:
-    needs: android-runtime
+  android-v8:
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install V8 toolchain (LLVM 21, lld, python venv)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config python3-venv xz-utils
+          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          sudo apt-get install -y libclang-21-dev lld-21
+          sudo ln -sf /usr/lib/llvm-21/lib/libclang.so /usr/lib/libclang.so || true
+          echo "OPERIT_LIBCLANG_DIR=/usr/lib/llvm-21/lib" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-linux-android
+
+      - name: Fetch Android NDK r29 beta4
+        run: |
+          bash tools/android-runtime/fetch_ndk_wsl.sh
+          echo "OPERIT_ANDROID_V8_NDK=$HOME/.cache/operit-android-runtime/android-ndk-r29-beta4" >> "$GITHUB_ENV"
+
+      - name: Cache source-built V8
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools/release/work/android-v8
+            apps/flutter/native/operit-flutter-bridge/target/operit-v8
+          key: android-v8-${{ hashFiles('apps/flutter/native/operit-flutter-bridge/Cargo.lock', 'tools/build_scripts/prepare_android_v8.py') }}
+          restore-keys: |
+            android-v8-
+
+      - name: Build V8 for aarch64-linux-android
+        run: |
+          python3 tools/build_scripts/prepare_android_v8.py \
+            --target aarch64-linux-android \
+            --env-file apps/flutter/native/operit-flutter-bridge/target/operit-v8/aarch64-linux-android.v8.env
+          cat apps/flutter/native/operit-flutter-bridge/target/operit-v8/aarch64-linux-android.v8.env
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-v8
+          path: |
+            tools/release/work/android-v8
+            apps/flutter/native/operit-flutter-bridge/target/operit-v8
+          if-no-files-found: error
+          retention-days: 14
+
+  apk:
+    needs: [android-runtime, android-v8]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 200
     env:
       RUSTFLAGS: -Awarnings
     steps:
@@ -99,6 +152,11 @@ jobs:
         with:
           name: android-runtime
           path: apps/flutter/app/android/app/src/main
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-v8
+          path: .
 
       - uses: actions/setup-java@v4
         with:
@@ -138,7 +196,12 @@ jobs:
       - name: Install Android SDK, NDK and libclang
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev python3-venv
+          sudo apt-get install -y python3-venv
+          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          sudo apt-get install -y libclang-21-dev lld-21
+          echo "OPERIT_LIBCLANG_DIR=/usr/lib/llvm-21/lib" >> "$GITHUB_ENV"
           SDK="$HOME/android-sdk"
           mkdir -p "$SDK/cmdline-tools"
           curl -fsSL -o /tmp/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
@@ -151,23 +214,6 @@ jobs:
           echo "$SDK/platform-tools" >> "$GITHUB_PATH"
           yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
-          # V8 source bindings require libclang 21.1+: install LLVM 21 and expose libclang.so.21
-          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 21
-          sudo apt-get install -y libclang-21-dev lld-21
-          sudo ln -sf /usr/lib/llvm-21/lib/libclang.so.1 /usr/lib/libclang.so.21
-          sudo ln -sf /usr/lib/llvm-21/lib/libclang.so.1 /usr/lib/libclang.so
-          ls -l /usr/lib/libclang.so.21
-          echo "OPERIT_LIBCLANG_DIR=/usr/lib" >> "$GITHUB_ENV"
-
-      - name: Cache Android V8 build
-        uses: actions/cache@v4
-        with:
-          path: tools/release/work/android-v8
-          key: android-v8-${{ hashFiles('apps/flutter/native/operit-flutter-bridge/Cargo.lock', 'tools/build_scripts/prepare_android_v8.py') }}
-          restore-keys: |
-            android-v8-
 
       - name: Install project Flutter SDK
         working-directory: apps/flutter/app
