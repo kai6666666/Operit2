@@ -27,11 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
       - name: Merge upstream main
         id: merge
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
         run: |
           git config user.name "operit2-sync-bot"
           git config user.email "actions@users.noreply.github.com"
@@ -48,7 +50,22 @@ jobs:
             AFTER=$(git rev-parse HEAD)
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "after=$AFTER"
-            git push origin HEAD:main
+            PUSH_URL="origin"
+            if [ -n "$SYNC_PAT" ]; then
+              PUSH_URL="https://x-access-token:${SYNC_PAT}@github.com/kai6666666/Operit2.git"
+            fi
+            for attempt in 1 2 3 4 5; do
+              if git push "$PUSH_URL" HEAD:main; then
+                echo "pushed on attempt $attempt"
+                break
+              fi
+              echo "push attempt $attempt failed; retrying"
+              sleep $((attempt * 15))
+              if [ "$attempt" = "5" ]; then
+                echo "::error::push to fork failed after 5 attempts"
+                exit 1
+              fi
+            done
           else
             echo "::error::upstream merge conflict; resolve manually in the fork"
             git merge --abort || true
