@@ -100,8 +100,14 @@ jobs:
           chmod +x /tmp/llvm.sh
           sudo /tmp/llvm.sh 21
           sudo apt-get install -y libclang-21-dev lld-21
-          sudo ln -sf /usr/lib/llvm-21/lib/libclang.so /usr/lib/libclang.so || true
-          echo "OPERIT_LIBCLANG_DIR=/usr/lib/llvm-21/lib" >> "$GITHUB_ENV"
+          REAL=$(readlink -f /usr/lib/llvm-21/lib/libclang.so 2>/dev/null || true)
+          [ -n "$REAL" ] || REAL=$(ls /usr/lib/x86_64-linux-gnu/libclang-21.so* 2>/dev/null | head -n1)
+          echo "real libclang: $REAL"
+          sudo ln -sf "$REAL" /usr/lib/libclang.so.21
+          sudo ln -sf "$REAL" /usr/lib/libclang.so
+          ls -l /usr/lib/libclang.so.21
+          echo "OPERIT_LIBCLANG_DIR=/usr/lib" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=/usr/lib" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -201,7 +207,14 @@ jobs:
           chmod +x /tmp/llvm.sh
           sudo /tmp/llvm.sh 21
           sudo apt-get install -y libclang-21-dev lld-21
-          echo "OPERIT_LIBCLANG_DIR=/usr/lib/llvm-21/lib" >> "$GITHUB_ENV"
+          REAL=$(readlink -f /usr/lib/llvm-21/lib/libclang.so 2>/dev/null || true)
+          [ -n "$REAL" ] || REAL=$(ls /usr/lib/x86_64-linux-gnu/libclang-21.so* 2>/dev/null | head -n1)
+          echo "real libclang: $REAL"
+          sudo ln -sf "$REAL" /usr/lib/libclang.so.21
+          sudo ln -sf "$REAL" /usr/lib/libclang.so
+          ls -l /usr/lib/libclang.so.21
+          echo "OPERIT_LIBCLANG_DIR=/usr/lib" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=/usr/lib" >> "$GITHUB_ENV"
           SDK="$HOME/android-sdk"
           mkdir -p "$SDK/cmdline-tools"
           curl -fsSL -o /tmp/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
